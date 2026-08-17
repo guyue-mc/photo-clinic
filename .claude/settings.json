@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(D:/photo-agent/.venv/Scripts/python.exe -m uvicorn photo_clinic.server:create_app --factory --host 0.0.0.0 --port 8000)",
+      "Bash(.venv/Scripts/python.exe -X utf8 -c ' *)",
+      "Bash(.venv/Scripts/python.exe -c ' *)",
+      "Bash(netstat -ano)",
+      "Bash(netsh advfirewall *)",
+      "Bash(curl -s -m 5 http://127.0.0.1:8000/health)",
+      "WebSearch",
+      "Bash(git config *)",
+      "Bash(git branch *)",
+      "Bash(git add *)",
+      "Bash(git commit *)"
+    ]
+  }
+}

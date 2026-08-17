@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "photo-clinic"
+version = "0.1.0"
+description = "摄影评审 Agent：AI 图判定 → 风景/人物分类 → 板块 rubric 评审（FastAPI + SKILL.md 驱动）"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12"
+dependencies = [
+    "openai>=1.60",
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    "pydantic>=2.12",
+    "pillow>=12.0",
+    "pyyaml>=6.0.3",
+]
+
+[project.optional-dependencies]
+claude = ["anthropic>=0.122"]
+c2pa = ["c2pa-python>=0.32"]
+dev = ["pytest>=8.3", "pytest-asyncio>=0.24", "httpx>=0.27", "ruff>=0.8"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/photo_clinic"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
