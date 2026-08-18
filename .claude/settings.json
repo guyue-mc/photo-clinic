@@ -1,7 +1,7 @@
 {
   "permissions": {
     "allow": [
-      "Bash(D:/photo-agent/.venv/Scripts/python.exe -m uvicorn photo_clinic.server:create_app --factory --host 0.0.0.0 --port 8000)",
+      "Bash(D:/PhotoClinic/.venv/Scripts/python.exe -m uvicorn photo_clinic.server:create_app --factory --host 0.0.0.0 --port 8000)",
       "Bash(.venv/Scripts/python.exe -X utf8 -c ' *)",
       "Bash(.venv/Scripts/python.exe -c ' *)",
       "Bash(netstat -ano)",
@@ -11,7 +11,36 @@
       "Bash(git config *)",
       "Bash(git branch *)",
       "Bash(git add *)",
-      "Bash(git commit *)"
+      "Bash(git commit *)",
+      "Bash(git remote *)",
+      "Bash(git tag *)",
+      "Bash(git push *)",
+      "Bash(gh release *)",
+      "Bash(rm /c/Users/宋瑞祥/AppData/Local/Temp/release-notes.md)",
+      "Bash(mv /d/photo-agent /d/PhotoClinic)",
+      "Read(//d//**)",
+      "Bash(cd /d)",
+      "Bash(tasklist)",
+      "Bash(tasklist //FO CSV)",
+      "Bash(.venv/Scripts/python -m pytest -q)",
+      "Bash(.venv/Scripts/pip show *)",
+      "Bash(.venv/Scripts/pip uninstall *)",
+      "Bash(.venv/Scripts/pip install *)",
+      "Bash(.venv/Scripts/python -m pip uninstall -y photo_agent photo-clinic)",
+      "Bash(echo \"--- uninstall rc=$? ---\")",
+      "Bash(.venv/Scripts/python -m pip install -e . --no-build-isolation)",
+      "Bash(.venv/Scripts/python -m pip install -e .)",
+      "Bash(.venv/Scripts/python -)",
+      "Bash(.venv/Scripts/python -m ruff check src tests)",
+      "Read(//d/测试图/**)",
+      "Bash(python -c ' *)",
+      "Edit(/.claude/skills/portrait-review/**)",
+      "Bash(.venv/Scripts/python.exe -m pytest tests/ -q)",
+      "Bash(.venv/Scripts/python.exe -m uvicorn photo_clinic.server:create_app --factory --host 0.0.0.0 --port 8000)",
+      "Bash(curl -s -m 3 http://127.0.0.1:8000/health)",
+      "Bash(break)",
+      "Bash(PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe -c ' *)",
+      "Bash(grep -v \"^$\")"
     ]
   }
 }

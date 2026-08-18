@@ -1,8 +1,13 @@
 """HTTP 路由：POST /api/review、GET /health、GET /skills + 异常映射。"""
 from __future__ import annotations
 
+import asyncio
+import json
+
 from fastapi import APIRouter, Depends, FastAPI, Header, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from pydantic import ValidationError
 
 from photo_clinic.config import Config
 from photo_clinic.metadata import (
@@ -34,10 +39,22 @@ def _make_auth(access_key: str | None):
 def create_router(config: Config, skills: SkillRegistry, llm: Provider) -> APIRouter:
     router = APIRouter()
     auth_check = _make_auth(config.server_access_key)
+    # 并发闸门：LLM 调用耗时长，限制同时在途的评审请求数，防止大图请求堆叠撑爆内存
+    semaphore = asyncio.Semaphore(config.max_concurrent_reviews)
 
     @router.post("/api/review", response_model=ReviewResponse)
-    async def review(request_body: ReviewRequest, _: None = Depends(auth_check)) -> ReviewResponse:
-        return await run_review(request_body, config=config, skills=skills, llm=llm)
+    async def review(request: Request, _: None = Depends(auth_check)) -> ReviewResponse:
+        async with semaphore:
+            # 先拿闸门再读请求体：排队中的请求不持有已解析的 base64 大字符串
+            try:
+                request_body = ReviewRequest.model_validate(await request.json())
+            except ValidationError as exc:
+                raise RequestValidationError(exc.errors()) from exc
+            except json.JSONDecodeError as exc:
+                raise RequestValidationError(
+                    [{"loc": ["body"], "msg": f"JSON 解析失败: {exc}", "type": "json_invalid"}]
+                ) from exc
+            return await run_review(request_body, config=config, skills=skills, llm=llm)
 
     @router.get("/health")
     async def health() -> dict:

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from photo_clinic.registry import PRECHECK_SKILLS, ROUTE_TO_SKILL
-from photo_clinic.schemas import MetadataFlags, PrecheckResult
+from photo_clinic.schemas import BranchReviewResult, MetadataFlags, PrecheckResult
 from photo_clinic.skills import SkillRegistry
 
 BASE_PREAMBLE = (
@@ -14,6 +14,7 @@ PRECHECK_USER_TEXT = "对这张图片执行预检：判定是否 AI 生成，并
 PRECHECK_RECHECK_USER_TEXT = "对这张图片重新执行预检复核（重点：区分 AI 生成与重度后期）。"
 PRECHECK_RECLASSIFY_USER_TEXT = "对这张图片重新执行题材分类。"
 REVIEW_USER_TEXT = "对这张图片执行板块评审。"
+REVIEW_RECHECK_USER_TEXT = "对这张图片重新执行板块评审复核。"
 
 
 def build_precheck_system(registry: SkillRegistry, flags: MetadataFlags) -> str:
@@ -57,18 +58,34 @@ def build_reclassify_system(
     return build_precheck_system(registry, flags) + appendix
 
 
-def build_review_system(registry: SkillRegistry, route: str, suspect_ai: bool) -> str:
+def build_review_system(registry: SkillRegistry, route: str) -> str:
     parts = [BASE_PREAMBLE, registry.get(ROUTE_TO_SKILL[route]).body]
-    if suspect_ai:
-        # 只追加针对性的额外要求，不拼接 ai-image-review 的完整 rubric，
-        # 避免两套评分体系（构图/光线/后期 vs 主体主题/特效场景/光效对比）冲突
-        parts.append(
-            "额外要求：图片疑似 AI 生成但已进入本板块评审。评分维度与输出结构严格按上方本板块 rubric，"
-            "不要使用其他评分体系。另必须输出 prompt_suggestion，以「如果是AI生图：」开头，"
-            "针对画面中疑似 AI 生成的迹象给出提示词改进建议"
-            "（正向提示词修改示例 + 负面提示词补充 + 其他建议（参数/LoRA/重绘））。"
-        )
     return "\n\n".join(parts)
+
+
+def build_recheck_review_system(
+    registry: SkillRegistry, route: str, first: BranchReviewResult
+) -> str:
+    """板块评审复核：把第一轮结论作为数据附上，重点复核重大问题是否漏判。
+
+    第一轮未列出重大问题时触发（人物板块）：要求按 rubric 第 0 节重新独立排查，
+    尤其核查肤色判定的豁免是否被滥用。复核结论独立给出，可与第一轮不同。
+    """
+    deductions = "；".join(
+        f"{d.dimension}：{'、'.join(d.deductions)}" for d in first.dimensions if d.deductions
+    ) or "（无）"
+    appendix = (
+        "\n\n第一轮评审结果如下，请复核：\n"
+        f"total_score: {first.total_score}\n"
+        f"major_issues: {first.major_issues or '（无重大问题）'}\n"
+        f"第一轮扣分点：{deductions}\n"
+        f"第一轮认为以下方面可能存在重大问题：{('、'.join(first.possible_issues)) or '（未标注）'}\n"
+        "请按 rubric 第 0 节逐项重新独立排查，重点复核上述标注方面与扣分点对应的方面"
+        "（涉及肤色/皮肤质感时核查豁免条款是否被滥用），其余各项顺带复查，"
+        "一次性给出完整复核结论。复核结论独立给出，可与第一轮不同；"
+        "复核输出不会再次触发复核。"
+    )
+    return build_review_system(registry, route) + appendix
 
 
 def _metadata_hint(flags: MetadataFlags) -> str:

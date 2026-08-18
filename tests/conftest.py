@@ -64,7 +64,9 @@ PRECHECK_UNCERTAIN_LANDSCAPE = {
 }
 REVIEW = {
     "total_score": 7.5,
-    "dimensions": [{"dimension": "构图", "score": 8.0, "comment": "尚可"}],
+    "dimensions": [
+        {"dimension": "构图", "score": 8.0, "comment": "尚可", "deductions": ["地平线歪斜"]}
+    ],
     "improvements": {
         "pre_shooting": [{"aspect": "机位", "suggestion": "低机位仰拍"}],
         "post_processing": [{"aspect": "曝光", "suggestion": "提亮阴影"}],

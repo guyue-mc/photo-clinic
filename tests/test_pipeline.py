@@ -13,8 +13,20 @@ from conftest import (
 
 from photo_clinic.config import Config
 from photo_clinic.metadata import InvalidMediaTypeError
-from photo_clinic.pipeline import run_review
-from photo_clinic.schemas import ReviewRequest
+from photo_clinic.pipeline import (
+    MAJOR_DIMENSION_CAP,
+    _apply_major_score_cap,
+    _apply_skin_rule,
+    _strip_texture_major,
+    run_review,
+)
+from photo_clinic.schemas import (
+    BranchReviewResult,
+    DimensionScore,
+    ReviewRequest,
+    SkinReport,
+    TextureReport,
+)
 
 
 def make_config(tmp_path) -> Config:
@@ -64,6 +76,200 @@ async def test_route_portrait(skills, jpeg_image, tmp_path, fake_provider):
     assert resp.ai_suspicion is None
 
 
+REVIEW_POSSIBLE = {**REVIEW, "possible_issues": ["肤色"]}
+REVIEW_CLEAN = {**REVIEW, "dimensions": [{"dimension": "构图", "score": 8.0, "comment": "尚可"}]}
+REVIEW_WITH_MAJOR = {
+    **REVIEW_CLEAN,
+    "total_score": 6.0,
+    "major_issues": ["人物肤色发白发青，色温偏差导致偏离真实人体肤色"],
+}
+
+
+async def test_portrait_recheck_triggered_by_possible_issues_and_catches(
+    skills, jpeg_image, tmp_path, fake_provider
+):
+    # 首轮自评肤色不确定 → 触发复核，复核轮补判 → 按更严格结论（复核轮）整体替换
+    fake_provider.script("precheck", PRECHECK_PORTRAIT).script(
+        "review", [REVIEW_POSSIBLE, REVIEW_WITH_MAJOR]
+    )
+    resp = await run(skills, tmp_path, fake_provider, ReviewRequest(image_base64=jpeg_image))
+    rev_calls = [c for c in fake_provider.calls if c["step"] == "review"]
+    assert len(rev_calls) == 2
+    assert "第一轮认为以下方面可能存在重大问题" in rev_calls[1]["system"]
+    assert "肤色" in rev_calls[1]["system"]
+    assert resp.review.major_issues == REVIEW_WITH_MAJOR["major_issues"]
+    assert resp.review.total_score == 6.0
+    assert resp.usage.input_tokens == 300  # 预检 + 两轮评审
+
+
+async def test_portrait_recheck_agreement_keeps_first(
+    skills, jpeg_image, tmp_path, fake_provider
+):
+    # 触发复核但复核轮也无重大问题 → 沿用第一轮
+    fake_provider.script("precheck", PRECHECK_PORTRAIT).script(
+        "review", [REVIEW_POSSIBLE, REVIEW_POSSIBLE]
+    )
+    resp = await run(skills, tmp_path, fake_provider, ReviewRequest(image_base64=jpeg_image))
+    rev_calls = [c for c in fake_provider.calls if c["step"] == "review"]
+    assert len(rev_calls) == 2
+    assert resp.review.major_issues == []
+    assert resp.review.total_score == 7.5
+
+
+async def test_portrait_recheck_skipped_when_clean_first_round(
+    skills, jpeg_image, tmp_path, fake_provider
+):
+    # 首轮无扣分点且无不确定项 → 不再复核，省一次调用
+    fake_provider.script("precheck", PRECHECK_PORTRAIT).script("review", REVIEW_CLEAN)
+    resp = await run(skills, tmp_path, fake_provider, ReviewRequest(image_base64=jpeg_image))
+    rev_calls = [c for c in fake_provider.calls if c["step"] == "review"]
+    assert len(rev_calls) == 1
+    assert resp.review.major_issues == []
+    assert resp.usage.input_tokens == 200  # 预检 + 单轮评审
+
+
+async def test_portrait_recheck_triggered_by_deductions_alone(
+    skills, jpeg_image, tmp_path, fake_provider
+):
+    # 首轮无 uncertain 标注但有扣分点 → 也触发复核（折中触发条件）
+    fake_provider.script("precheck", PRECHECK_PORTRAIT).script(
+        "review", [REVIEW, REVIEW_WITH_MAJOR]
+    )
+    resp = await run(skills, tmp_path, fake_provider, ReviewRequest(image_base64=jpeg_image))
+    rev_calls = [c for c in fake_provider.calls if c["step"] == "review"]
+    assert len(rev_calls) == 2
+    assert "第一轮扣分点" in rev_calls[1]["system"]
+    assert "地平线歪斜" in rev_calls[1]["system"]
+    assert resp.review.major_issues == REVIEW_WITH_MAJOR["major_issues"]
+
+
+async def test_portrait_recheck_skipped_when_confident_with_major_found(
+    skills, jpeg_image, tmp_path, fake_provider
+):
+    # 首轮已判出重大问题且无不确定项 → 不再复核
+    fake_provider.script("precheck", PRECHECK_PORTRAIT).script("review", REVIEW_WITH_MAJOR)
+    resp = await run(skills, tmp_path, fake_provider, ReviewRequest(image_base64=jpeg_image))
+    rev_calls = [c for c in fake_provider.calls if c["step"] == "review"]
+    assert len(rev_calls) == 1
+    assert resp.review.major_issues == REVIEW_WITH_MAJOR["major_issues"]
+
+
+async def test_portrait_recheck_runs_once_and_not_recursive(
+    skills, jpeg_image, tmp_path, fake_provider
+):
+    # 复核轮输出也带 possible_issues → 仍只跑一轮复核，不递归
+    recheck_payload = {**REVIEW_WITH_MAJOR, "possible_issues": ["皮肤质感"]}
+    fake_provider.script("precheck", PRECHECK_PORTRAIT).script(
+        "review", [REVIEW_POSSIBLE, recheck_payload]
+    )
+    resp = await run(skills, tmp_path, fake_provider, ReviewRequest(image_base64=jpeg_image))
+    rev_calls = [c for c in fake_provider.calls if c["step"] == "review"]
+    assert len(rev_calls) == 2
+    assert resp.review.major_issues == recheck_payload["major_issues"]
+
+
+async def test_non_portrait_review_skips_recheck(
+    skills, jpeg_image, tmp_path, fake_provider
+):
+    # 重大问题语义仅人物板块：landscape 即使带 possible_issues 也不走复核
+    fake_provider.script("precheck", PRECHECK_LANDSCAPE).script("review", REVIEW_POSSIBLE)
+    resp = await run(skills, tmp_path, fake_provider, ReviewRequest(image_base64=jpeg_image))
+    rev_calls = [c for c in fake_provider.calls if c["step"] == "review"]
+    assert len(rev_calls) == 1
+    assert resp.route == "landscape"
+
+
+def make_result(**kw) -> BranchReviewResult:
+    return BranchReviewResult(total_score=7.0, dimensions=[], **kw)
+
+
+def test_strip_texture_major_removes_retouch_keeps_others():
+    result = make_result(
+        major_issues=[
+            "皮肤质感处理过度，毛孔不可见，塑料感明显",
+            "肤色在冷光环境下偏青白，属异常处理",
+        ]
+    )
+    updated = _strip_texture_major(result)
+    assert updated.major_issues == ["肤色在冷光环境下偏青白，属异常处理"]
+
+
+def test_strip_texture_major_keeps_unrelated_issues():
+    result = make_result(major_issues=["曝光硬伤：窗外大面积过曝死白"])
+    assert _strip_texture_major(result) is result
+
+
+def test_skin_rule_injects_major_when_pale_or_white():
+    for whiteness in ("pale", "white"):
+        result = make_result(skin_report=SkinReport(whiteness=whiteness, exempt=False))
+        updated = _apply_skin_rule(result)
+        assert len(updated.major_issues) == 1
+        assert "肤色异常" in updated.major_issues[0]
+
+
+def test_skin_rule_skips_natural_or_exempt():
+    for rep in (
+        SkinReport(whiteness="natural", exempt=False),
+        SkinReport(whiteness="white", exempt=True),  # 非人类色/强风格化豁免
+    ):
+        updated = _apply_skin_rule(make_result(skin_report=rep))
+        assert updated.major_issues == []
+
+
+def test_skin_rule_no_duplicate_when_model_already_flagged():
+    result = make_result(
+        major_issues=["肤色在冷光环境下偏青白，属异常处理"],
+        skin_report=SkinReport(whiteness="pale", exempt=False),
+    )
+    updated = _apply_skin_rule(result)
+    assert updated.major_issues == ["肤色在冷光环境下偏青白，属异常处理"]
+
+
+def scored_result(total: float, *dims) -> BranchReviewResult:
+    return BranchReviewResult(total_score=total, dimensions=list(dims))
+
+
+def test_major_score_cap_caps_post_processing_and_recomputes_total():
+    result = scored_result(
+        9.0,
+        DimensionScore(dimension="构图", score=3.0, comment="x"),
+        DimensionScore(dimension="光线", score=4.0, comment="x"),
+        DimensionScore(dimension="后期", score=2.0, comment="x"),
+    )
+    result.major_issues = ["肤色在冷光环境下偏青白，属异常处理"]
+    updated = _apply_major_score_cap(result)
+    late = next(d for d in updated.dimensions if d.dimension == "后期")
+    assert late.score == MAJOR_DIMENSION_CAP
+    assert late.original_score == 2.0  # 原始小计保留，供展示「常规 X − 重大扣 Y = 实得 Z」
+    assert late.major_deduction == 1.0
+    assert updated.total_score == 3.0 + 4.0 + MAJOR_DIMENSION_CAP
+
+
+def test_major_score_cap_maps_exposure_to_lighting():
+    result = scored_result(
+        7.0,
+        DimensionScore(dimension="构图", score=3.0, comment="x"),
+        DimensionScore(dimension="光线", score=2.0, comment="x"),
+        DimensionScore(dimension="后期", score=2.0, comment="x"),
+    )
+    result.major_issues = ["曝光硬伤：窗外大面积过曝死白"]
+    updated = _apply_major_score_cap(result)
+    light = next(d for d in updated.dimensions if d.dimension == "光线")
+    assert light.score == MAJOR_DIMENSION_CAP
+
+
+def test_major_score_cap_noop_without_major_issues():
+    result = scored_result(
+        9.0,
+        DimensionScore(dimension="构图", score=3.0, comment="x"),
+        DimensionScore(dimension="光线", score=4.0, comment="x"),
+        DimensionScore(dimension="后期", score=2.0, comment="x"),
+    )
+    updated = _apply_major_score_cap(result)
+    assert updated.total_score == 9.0
+    assert all(d.score == s for d, s in zip(updated.dimensions, (3.0, 4.0, 2.0)))
+
+
 async def test_route_rejected_makes_single_call(skills, jpeg_image, tmp_path, fake_provider):
     fake_provider.script("precheck", PRECHECK_OTHER)
     resp = await run(skills, tmp_path, fake_provider, ReviewRequest(image_base64=jpeg_image))
@@ -88,9 +294,8 @@ async def test_metadata_short_circuit_skips_precheck(
     assert fake_provider.calls[0]["step"] == "review"
 
 
-async def test_suspect_ai_appends_ai_rubric_and_warns(
-    skills, jpeg_image, tmp_path, fake_provider
-):
+async def test_suspect_ai_warns_above_threshold(skills, jpeg_image, tmp_path, fake_provider):
+    # 置信度 ≥50% 的 uncertain 才有疑似 AI 点评
     fake_provider.script("precheck", PRECHECK_UNCERTAIN_LANDSCAPE).script("review", REVIEW)
     resp = await run(skills, tmp_path, fake_provider, ReviewRequest(image_base64=jpeg_image))
     assert resp.route == "landscape"
@@ -98,8 +303,18 @@ async def test_suspect_ai_appends_ai_rubric_and_warns(
     assert "疑似 AI 生成" in resp.ai_suspicion.warning
     system = fake_provider.calls[1]["system"]
     assert "landscape-review" in system
-    assert "不要使用其他评分体系" in system  # 防止拼接 AI rubric 导致评分维度冲突
-    assert resp.review.prompt_suggestion
+    # 不再追加 AI rubric / 提示词要求：疑似路径也严格按本板块契约输出
+    assert "不要使用其他评分体系" not in system
+    assert "prompt_suggestion" not in system
+
+
+async def test_uncertain_below_threshold_no_warning(skills, jpeg_image, tmp_path, fake_provider):
+    # 置信度 <50% 的 uncertain 不提示疑似 AI（视为普通照片）
+    low = {**PRECHECK_UNCERTAIN_LANDSCAPE, "ai_confidence": 40}
+    fake_provider.script("precheck", low).script("review", REVIEW)
+    resp = await run(skills, tmp_path, fake_provider, ReviewRequest(image_base64=jpeg_image))
+    assert resp.route == "landscape"
+    assert resp.ai_suspicion is None
 
 
 async def test_media_type_mismatch_raises(skills, jpeg_image, tmp_path, fake_provider):
@@ -202,11 +417,11 @@ async def test_borderline_uncertain_triggers_recheck_and_disagreement_is_uncerta
     pre_calls = [c for c in fake_provider.calls if c["step"] == "precheck"]
     assert len(pre_calls) == 2
     assert "第一轮证据" in pre_calls[1]["system"]
-    # 两轮分歧 → uncertain，置信度取均值 (60+10)/2
+    # 两轮分歧 → uncertain，置信度取均值 (60+10)/2 = 35% < 50% → 不提示疑似 AI
     assert resp.route == "landscape"
     assert resp.ai_detection.verdict == "uncertain"
     assert resp.ai_detection.confidence == pytest.approx(0.35)
-    assert resp.ai_suspicion is not None
+    assert resp.ai_suspicion is None
     assert resp.usage.input_tokens == 300  # 两次预检 + 一次评审
 
 

@@ -5,6 +5,7 @@ import base64
 import binascii
 import io
 from dataclasses import dataclass
+from functools import cached_property
 
 from PIL import Image
 
@@ -56,6 +57,13 @@ class ImageTooLargeError(Exception):
     """解码后字节数超过上限。"""
 
 
+def _strip_whitespace(s: str) -> str:
+    """去除 base64 串中的空白字符；常规路径（无空白）只做一遍扫描，零复制。"""
+    if not any(ch.isspace() for ch in s):
+        return s
+    return "".join(s.split())
+
+
 @dataclass(frozen=True)
 class DecodedImage:
     data: bytes
@@ -64,9 +72,17 @@ class DecodedImage:
     width: int
     height: int
 
+    @cached_property
+    def b64(self) -> str:
+        """base64 编码（惰性缓存）：一次请求多次 LLM 调用复用，不再重复编码整份图片。"""
+        return base64.b64encode(self.data).decode()
+
 
 # 自动压缩目标：长边上限（像素）
 AUTO_COMPRESS_MAX_EDGE = 2000
+# LLM 评审用图上限：长边 ≤3000px 且 ≤2MB（保留更多皮肤纹理细节供模型判断；上传自动压缩护栏不受影响）
+LLM_IMAGE_MAX_EDGE = 3000
+LLM_IMAGE_MAX_BYTES = 2 * 1024 * 1024
 # 硬上限 = max_bytes 的 5 倍（防内存 DoS；自动压缩只在硬上限以内生效）
 _HARD_LIMIT_MULTIPLIER = 5
 
@@ -75,7 +91,7 @@ def decode_image(
     image_base64: str, max_bytes: int, *, auto_compress: bool = False
 ) -> DecodedImage:
     """解码并校验图片；超过 max_bytes 时若 auto_compress 则自动压缩（长边 ≤2000px 且 ≤max_bytes）。"""
-    compact = "".join(image_base64.split())
+    compact = _strip_whitespace(image_base64)
     hard_limit = max_bytes * _HARD_LIMIT_MULTIPLIER
     # 解码前预检长度上限（base64 膨胀约 4/3），避免超大 payload 先整体解码再判大
     if len(compact) > (hard_limit * 4 + 2) // 3:
@@ -107,6 +123,30 @@ def compress_image(
     data: bytes, *, max_bytes: int, max_edge: int = AUTO_COMPRESS_MAX_EDGE
 ) -> bytes:
     """压缩到长边 ≤ max_edge 且字节 ≤ max_bytes（JPEG 逐级降质；透明图白底合成）。"""
+    out, _, _ = _resize_reencode(data, max_edge=max_edge, max_bytes=max_bytes)
+    return out
+
+
+def downscale_image(
+    img: DecodedImage,
+    *,
+    max_edge: int = LLM_IMAGE_MAX_EDGE,
+    max_bytes: int = LLM_IMAGE_MAX_BYTES,
+) -> DecodedImage:
+    """LLM 评审用小图：长边与字节均已达标则原样返回，否则重编码为 JPEG。
+
+    必须在元数据检测之后调用：重编码会丢弃 EXIF / PNG 参数块等 AI 证据。
+    """
+    if img.width <= max_edge and img.height <= max_edge and len(img.data) <= max_bytes:
+        return img
+    data, width, height = _resize_reencode(img.data, max_edge=max_edge, max_bytes=max_bytes)
+    return DecodedImage(data=data, media_type="image/jpeg", format="JPEG", width=width, height=height)
+
+
+def _resize_reencode(
+    data: bytes, *, max_edge: int, max_bytes: int
+) -> tuple[bytes, int, int]:
+    """重编码为 JPEG：长边缩至 ≤ max_edge，逐级降质压到 ≤ max_bytes。"""
     with Image.open(io.BytesIO(data)) as img:
         img.load()
         img.thumbnail((max_edge, max_edge))
@@ -116,6 +156,7 @@ def compress_image(
             img = background
         elif img.mode not in ("RGB", "L"):
             img = img.convert("RGB")
+        width, height = img.size
         smallest = None
         for quality in (85, 70, 60, 50, 40):
             buf = io.BytesIO()
@@ -123,8 +164,8 @@ def compress_image(
             out = buf.getvalue()
             smallest = out
             if len(out) <= max_bytes:
-                return out
-        return smallest  # 最低质量仍超限（极端情况），返回最小体积版本
+                return out, width, height
+        return smallest, width, height  # 最低质量仍超限（极端情况），返回最小体积版本
 
 
 # c2pa 可用性缓存：导入可能因未安装（ImportError）或原生库加载失败（如系统

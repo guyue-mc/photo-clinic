@@ -1,7 +1,6 @@
 """Provider 协议与公共错误。"""
 from __future__ import annotations
 
-import base64
 from typing import Protocol
 
 from pydantic import BaseModel
@@ -38,4 +37,4 @@ def image_to_data_uri(image: DecodedImage) -> str:
 
 
 def image_b64(image: DecodedImage) -> str:
-    return base64.b64encode(image.data).decode()
+    return image.b64  # 惰性缓存：同一次请求内重复调用不再重复编码

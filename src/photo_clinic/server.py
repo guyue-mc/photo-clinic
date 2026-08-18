@@ -25,7 +25,7 @@ def create_app(config: Config | None = None, llm: Provider | None = None) -> Fas
 
     from photo_clinic.api.routes import create_router, register_exception_handlers
 
-    app = FastAPI(title="photo-agent", version=__version__)
+    app = FastAPI(title="PhotoClinic", version=__version__)
     register_exception_handlers(app)
     if config.allowed_origins:
         from fastapi.middleware.cors import CORSMiddleware

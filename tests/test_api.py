@@ -36,6 +36,7 @@ def test_review_landscape_200(client, fake_provider, jpeg_image):
     body = resp.json()
     assert body["route"] == "landscape"
     assert body["review"]["skill"] == "landscape-review"
+    assert body["review"]["dimensions"][0]["deductions"] == ["地平线歪斜"]
     assert body["ai_detection"]["verdict"] == "not_ai"
     assert body["model"] == "test-model"
 

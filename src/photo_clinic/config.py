@@ -26,6 +26,8 @@ class Config:
     server_access_key: str | None = None
     # CORS 允许的来源（逗号分隔）；空 = 不加 CORS 中间件
     allowed_origins: list[str] = field(default_factory=list)
+    # 同时在途的评审请求上限（LLM 调用耗时长，限制并发防止大图请求堆叠撑爆内存）
+    max_concurrent_reviews: int = 4
 
     @property
     def max_image_bytes(self) -> int:
@@ -67,4 +69,5 @@ def load_config() -> Config:
         skills_dir=skills_dir,
         server_access_key=os.environ.get("PHOTO_AGENT_ACCESS_KEY") or None,
         allowed_origins=allowed_origins,
+        max_concurrent_reviews=int(os.environ.get("PHOTO_AGENT_MAX_CONCURRENT_REVIEWS") or "4"),
     )

@@ -4,10 +4,11 @@ from __future__ import annotations
 from photo_clinic.prompts import (
     BASE_PREAMBLE,
     build_precheck_system,
+    build_recheck_review_system,
     build_recheck_system,
     build_review_system,
 )
-from photo_clinic.schemas import MetadataFlags
+from photo_clinic.schemas import BranchReviewResult, MetadataFlags
 
 
 def test_precheck_system_contains_preamble_and_rubrics(skills):
@@ -32,19 +33,52 @@ def test_precheck_strong_no_metadata_hint(skills):
 
 
 def test_review_system_normal_route(skills):
-    system = build_review_system(skills, "landscape", suspect_ai=False)
+    system = build_review_system(skills, "landscape")
     assert skills.get("landscape-review").body in system
     assert "ai-image-review" not in system
     assert "prompt_suggestion" not in system
 
 
-def test_review_system_suspect_ai_adds_prompt_requirement(skills):
-    system = build_review_system(skills, "portrait", suspect_ai=True)
+def test_review_system_no_ai_rubric_merge_for_any_route(skills):
+    # 不再追加 AI 提示词要求：任何路由都只拼本板块 rubric，不引入 prompt_suggestion 指令
+    for route in ("landscape", "portrait"):
+        system = build_review_system(skills, route)
+        assert skills.get(f"{route}-review").body in system
+        assert skills.get("ai-image-review").body not in system
+        assert "prompt_suggestion" not in system
+        assert "不要使用其他评分体系" not in system
+
+
+def test_recheck_review_system_attaches_first_round_result(skills):
+    first = BranchReviewResult(
+        total_score=7.0,
+        dimensions=[],
+        major_issues=[],
+    )
+    system = build_recheck_review_system(skills, "portrait", first)
     assert skills.get("portrait-review").body in system
-    # 不拼接 ai-image-review 完整 rubric（避免两套评分体系冲突），只追加针对性要求
-    assert skills.get("ai-image-review").body not in system
-    assert "prompt_suggestion" in system
-    assert "不要使用其他评分体系" in system
+    assert "第一轮评审结果" in system
+    assert "无重大问题" in system
+    assert "豁免条款是否被滥用" in system
+
+
+def test_recheck_review_system_shows_first_round_issues(skills):
+    from photo_clinic.schemas import DimensionScore
+
+    first = BranchReviewResult(
+        total_score=6.0,
+        dimensions=[
+            DimensionScore(dimension="后期", score=1.0, comment="x", deductions=["塑料感"])
+        ],
+        major_issues=["人物肤色发白发青"],
+        possible_issues=["肤色", "皮肤质感"],
+    )
+    system = build_recheck_review_system(skills, "portrait", first)
+    assert "人物肤色发白发青" in system
+    assert "第一轮扣分点：后期：塑料感" in system
+    assert "第一轮认为以下方面可能存在重大问题" in system
+    assert "肤色、皮肤质感" in system
+    assert "不会再次触发复核" in system
 
 
 def test_recheck_system_includes_first_round_evidence(skills):

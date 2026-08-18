@@ -6,14 +6,17 @@ from photo_clinic.metadata import (
     DecodedImage,
     InvalidMediaTypeError,
     decode_image,
+    downscale_image,
     inspect_metadata,
 )
 from photo_clinic.prompts import (
     PRECHECK_RECHECK_USER_TEXT,
     PRECHECK_RECLASSIFY_USER_TEXT,
     PRECHECK_USER_TEXT,
+    REVIEW_RECHECK_USER_TEXT,
     REVIEW_USER_TEXT,
     build_precheck_system,
+    build_recheck_review_system,
     build_recheck_system,
     build_reclassify_system,
     build_review_system,
@@ -61,6 +64,9 @@ async def run_review(
     model = request.model or config.model
 
     flags = inspect_metadata(image)
+    # 送 LLM 的图统一压到 ≤3000px/≤2MB（元数据检测已在此前完成；重编码会丢弃 EXIF 等证据），
+    # 保留皮肤纹理细节供模型判断，同时限制单请求内存放大倍数，多轮调用复用同一份小图
+    image = downscale_image(image)
     if flags.evidence_strength == "strong":
         # 元数据实锤 → 短路判 AI，跳过 LLM 预检，直接 AI 板块评审
         ai_detection = AiDetection(
@@ -70,7 +76,7 @@ async def run_review(
             metadata=flags,
             source="metadata",
         )
-        review, tokens = await _review_branch(llm, skills, image, "ai", suspect_ai=False, model=model)
+        review, tokens = await _review_branch(llm, skills, image, "ai", model=model)
         _add_usage(usage, tokens)
         return ReviewResponse(
             route="ai",
@@ -107,7 +113,7 @@ async def run_review(
         source="llm",
     )
     if pre.is_ai == "ai":
-        review, tokens = await _review_branch(llm, skills, image, "ai", suspect_ai=False, model=model)
+        review, tokens = await _review_branch(llm, skills, image, "ai", model=model)
         _add_usage(usage, tokens)
         return ReviewResponse(
             route="ai",
@@ -140,13 +146,11 @@ async def run_review(
             usage=usage,
         )
 
-    suspect_ai = pre.is_ai == "uncertain"
-    review, tokens = await _review_branch(
-        llm, skills, image, pre.category, suspect_ai=suspect_ai, model=model
-    )
+    review, tokens = await _review_branch(llm, skills, image, pre.category, model=model)
     _add_usage(usage, tokens)
     ai_suspicion = None
-    if suspect_ai:
+    # 仅置信度 ≥50% 才提示"疑似 AI"（低于此值视为普通照片，不出疑似点评）
+    if pre.is_ai == "uncertain" and pre.ai_confidence >= 50.0:
         ai_suspicion = AiSuspicion(
             warning=f"疑似 AI 生成（置信度 {pre.ai_confidence:.0f}%）：{ai_reason}"
         )
@@ -162,17 +166,81 @@ async def run_review(
     )
 
 
+# 重大问题 → 所属维度映射关键词（按 rubric 第 0 节词汇表）与封顶分
+MAJOR_DIMENSION_KEYWORDS = {
+    "构图": ("构图", "畸变", "裁切", "穿头", "倾斜", "平衡"),
+    "光线": ("曝光", "过曝", "死黑", "光比", "阴影", "光线"),
+    "后期": ("肤色", "塑料", "液化", "色调", "皮肤", "后期"),
+}
+MAJOR_DIMENSION_CAP = 1.0  # 重大问题命中后，所属维度得分封顶（狠狠扣分）
+# 磨皮/皮肤质感类问题不进重大问题（按用户定案：最多扣分点），命中即从 major_issues 中剔除
+TEXTURE_MAJOR_KEYWORDS = ("磨皮", "皮肤质感", "塑料感", "毛孔", "肌理")
+
+
+def _strip_texture_major(result: BranchReviewResult) -> BranchReviewResult:
+    """把磨皮/皮肤质感类条目从 major_issues 中剔除（含模型自行写入的）。"""
+    kept = [
+        issue
+        for issue in result.major_issues
+        if not any(k in issue for k in TEXTURE_MAJOR_KEYWORDS)
+    ]
+    if len(kept) == len(result.major_issues):
+        return result
+    return result.model_copy(update={"major_issues": kept})
+
+
+SKIN_MAJOR_MESSAGE = "肤色异常：皮肤发白（偏白/惨白），缺乏血色，偏离真实人体肤色"
+
+
+def _apply_skin_rule(result: BranchReviewResult) -> BranchReviewResult:
+    """肤色规则判定：模型在 skin_report 中只报告事实，是否重大问题由规则决定。
+
+    阈值：肤色发白（pale/white）且不满足豁免（exempt=False）即构成重大问题
+    （cosplay/角色扮演不豁免）。命中且 major_issues 中尚无对应条目时补入标准文案。
+    """
+    report = result.skin_report
+    if report is None:
+        return result
+    severe = report.whiteness in ("pale", "white") and not report.exempt
+    if severe and not any("肤色" in issue or "发白" in issue for issue in result.major_issues):
+        return result.model_copy(
+            update={"major_issues": [*result.major_issues, SKIN_MAJOR_MESSAGE]}
+        )
+    return result
+
+
+def _apply_major_score_cap(result: BranchReviewResult) -> BranchReviewResult:
+    """重大问题 → 所属维度狠狠扣分：命中后该维度得分封顶 1.0，总分按扣后分值重算。"""
+    if not result.major_issues:
+        return result
+    dims = {d.dimension: d for d in result.dimensions}
+    capped = False
+    for issue in result.major_issues:
+        for dim_name, keywords in MAJOR_DIMENSION_KEYWORDS.items():
+            if dim_name in dims and any(k in issue for k in keywords):
+                dim = dims[dim_name]
+                if dim.score > MAJOR_DIMENSION_CAP:
+                    # 记录扣分前的原始小计与扣分额，供展示「常规项 X 分 − 重大扣 Y 分 = 实得 Z 分」
+                    dim.original_score = dim.score
+                    dim.major_deduction = dim.score - MAJOR_DIMENSION_CAP
+                    dim.score = MAJOR_DIMENSION_CAP
+                    capped = True
+                break
+    if capped and result.total_score is not None:
+        result.total_score = sum(d.score for d in result.dimensions)
+    return result
+
+
 async def _review_branch(
     llm: Provider,
     skills: SkillRegistry,
     image: DecodedImage,
     route: str,
     *,
-    suspect_ai: bool,
     model: str,
 ) -> tuple[BranchReview, tuple[int, int]]:
     result, in_tokens, out_tokens = await llm.structured_call(
-        system=build_review_system(skills, route, suspect_ai=suspect_ai),
+        system=build_review_system(skills, route),
         image=image,
         user_text=REVIEW_USER_TEXT,
         schema=BranchReviewResult,
@@ -180,6 +248,30 @@ async def _review_branch(
         step="review",
         model=model,
     )
+    # 人物板块重大问题复核：首轮自评存在不确定方面（possible_issues 非空）、或任一维度
+    # 有扣分点（说明画面存在瑕疵，值得复核）时触发一轮复核，一次性覆盖全部可能问题；
+    # 复核为终轮，不再递归触发。单轮 LLM 视觉判断有波动（肤色/磨皮判定偶发漏判），
+    # 复核轮判出重大问题时按更严格结论（复核轮）整体替换；复核轮无则沿用第一轮。
+    # 完全无瑕疵且无不确定项的图跳过复核，省一次调用。其余板块无重大问题语义。
+    if route == "portrait" and (
+        result.possible_issues or any(d.deductions for d in result.dimensions)
+    ):
+        recheck, in2, out2 = await llm.structured_call(
+            system=build_recheck_review_system(skills, route, result),
+            image=image,
+            user_text=REVIEW_RECHECK_USER_TEXT,
+            schema=BranchReviewResult,
+            max_tokens=REVIEW_MAX_TOKENS,
+            step="review",
+            model=model,
+        )
+        in_tokens += in2
+        out_tokens += out2
+        if recheck.major_issues:
+            result = recheck
+    result = _strip_texture_major(result)
+    result = _apply_skin_rule(result)
+    result = _apply_major_score_cap(result)
     review = BranchReview(
         skill=ROUTE_TO_SKILL[route],
         total_score=result.total_score,
@@ -187,6 +279,9 @@ async def _review_branch(
         improvements=result.improvements,
         bonus_notes=result.bonus_notes,
         prompt_suggestion=result.prompt_suggestion,
+        major_issues=result.major_issues,
+        texture_report=result.texture_report,
+        skin_report=result.skin_report,
     )
     return review, (in_tokens, out_tokens)
 

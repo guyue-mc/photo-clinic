@@ -70,10 +70,28 @@ class StageAdvice(BaseModel):
     post_processing: list[Improvement] = Field(default_factory=list)
 
 
+class TextureReport(BaseModel):
+    """皮肤质感结构化报告（模型只如实报告事实，是否重大问题由服务端规则判定）。"""
+
+    pore_visibility: Literal["clear", "partial", "none"] = "partial"  # 毛孔/肌理可见性
+    texture_coverage: Literal["most", "half", "partial", "little"] = "half"  # 可见纹理覆盖范围（most 大部分 / half 约一半 / partial 少部分 / little 几乎无）
+    plastic_level: Literal["none", "slight", "moderate", "obvious", "severe"] = "slight"  # 塑料/蜡质感程度（none 自然 / slight 轻微 / moderate 中等 / obvious 明显 / severe 严重）
+
+
+class SkinReport(BaseModel):
+    """肤色结构化报告（模型只如实报告事实，是否重大问题由服务端规则判定）。"""
+
+    whiteness: Literal["natural", "pale", "white"] = "natural"  # 肤色发白程度：natural 自然有血色 / pale 偏白发白 / white 惨白无血色
+    exempt: bool = False  # 豁免：皮肤本身为非人类色（蓝/紫/绿等）或整体强风格化（黑白/单色/强滤镜）；cosplay/角色扮演不豁免
+
+
 class DimensionScore(BaseModel):
     dimension: str
-    score: float  # 0-10
+    score: float  # 0-10（重大问题扣分后的实得分）
     comment: str
+    deductions: list[str] = Field(default_factory=list)  # 扣分点列表（空 = 无扣分点）
+    original_score: float | None = None  # 重大问题扣分前的原始小计（无重大扣分 = None）
+    major_deduction: float | None = None  # 重大问题扣分额（无重大扣分 = None）
 
 
 class Usage(BaseModel):
@@ -106,6 +124,10 @@ class BranchReviewResult(BaseModel):
     improvements: StageAdvice = Field(default_factory=StageAdvice)
     bonus_notes: str | None = None  # 加分/前提项观察（不计入总分，人物板块使用）
     prompt_suggestion: str | None = None  # 仅 AI 板块使用
+    major_issues: list[str] = Field(default_factory=list)  # 重大问题列表（空 = 无）
+    possible_issues: list[str] = Field(default_factory=list)  # 首轮自评可能存在问题的方面（非空才触发一轮复核；空 = 无需复核）
+    texture_report: TextureReport | None = None  # 皮肤质感结构化报告（仅人物板块）
+    skin_report: SkinReport | None = None  # 肤色结构化报告（仅人物板块）
 
     @field_validator("total_score")
     @classmethod
@@ -124,6 +146,8 @@ class BranchReview(BranchReviewResult):
     """板块评审结果（含路由到的 skill 名，由 pipeline 填充）。"""
 
     skill: str
+    texture_report: TextureReport | None = None  # 皮肤质感结构化报告（内部机制，不参与点评输出）
+    skin_report: SkinReport | None = None  # 肤色结构化报告（内部机制，不参与点评输出）
 
 
 class ReviewResponse(BaseModel):
