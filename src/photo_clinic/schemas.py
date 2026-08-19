@@ -92,6 +92,7 @@ class DimensionScore(BaseModel):
     deductions: list[str] = Field(default_factory=list)  # 扣分点列表（空 = 无扣分点）
     original_score: float | None = None  # 重大问题扣分前的原始小计（无重大扣分 = None）
     major_deduction: float | None = None  # 重大问题扣分额（无重大扣分 = None）
+    exceptional_note: str | None = None  # 满分维度的「出彩声明」（无瑕疵≠满分；无法给出出彩之处时不得给满分）
 
 
 class Usage(BaseModel):
@@ -128,6 +129,8 @@ class BranchReviewResult(BaseModel):
     possible_issues: list[str] = Field(default_factory=list)  # 首轮自评可能存在问题的方面（非空才触发一轮复核；空 = 无需复核）
     texture_report: TextureReport | None = None  # 皮肤质感结构化报告（仅人物板块）
     skin_report: SkinReport | None = None  # 肤色结构化报告（仅人物板块）
+    full_mark_endorsements: dict[str, str] = Field(default_factory=dict)  # 满分维度显式背书：维度名 → 背书理由（仅复核轮填写）
+    full_mark_critiques: dict[str, str] = Field(default_factory=dict)  # 复核轮对未背书满分维度的具体瑕疵说明：维度名 → 该维度存在的问题（仅复核轮填写）
 
     @field_validator("total_score")
     @classmethod

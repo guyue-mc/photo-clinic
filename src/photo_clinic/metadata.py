@@ -101,11 +101,18 @@ PALE_SKIN_WHITE_RATIO = 0.15
 PALE_SKIN_MAX_SKIN_RATIO = 0.30
 
 
+_BLUE_HUE_LO, _BLUE_HUE_HI = 90, 160  # 蓝色调色相区间（HSV 0-255 刻度）
+_BLUE_SAT_MIN = 30
+_BLUE_VAL_MIN = 120
+_BLUE_MAX_RATIO = 0.65  # 蓝色占比超过该值视为水体/天空场景，跳过判定
+
+
 def detect_pale_skin(img: DecodedImage) -> bool:
     """像素级肤色发白检测：发白像素占比 > 15% 且 正常肤色像素占比 < 30% 即判定。
 
     发白皮肤（青白/灰白/惨白）低饱和高亮，几乎不落在正常肤色区间；
-    正常皮肤（含暖调、健康肤色）占据采样区大部。阈值经 1.jpg/2.jpg 实测校准。
+    正常皮肤（含暖调、健康肤色）占据采样区大部。阈值经 1/2/5/6/7.jpg 实测校准。
+    蓝色主导（>65%）的采样区视为水体/天空场景，跳过判定（防水族馆等场景误报）。
     """
     w, h = img.width, img.height
     crop = (
@@ -120,13 +127,41 @@ def detect_pale_skin(img: DecodedImage) -> bool:
         return False
     skin = 0
     white = 0
+    blue = 0
     for hh, ss, vv in px:
         if vv > _SKIN_VAL_MIN and _SKIN_SAT_MIN < ss < _SKIN_SAT_MAX and (hh <= _SKIN_HUE_MAX or hh >= _SKIN_HUE_MIN):
             skin += 1
         if ss < _WHITE_SAT_MAX and vv > _WHITE_VAL_MIN:
             white += 1
+        if _BLUE_HUE_LO < hh < _BLUE_HUE_HI and ss > _BLUE_SAT_MIN and vv > _BLUE_VAL_MIN:
+            blue += 1
     n = len(px)
+    if blue / n > _BLUE_MAX_RATIO:
+        return False
     return (white / n) > PALE_SKIN_WHITE_RATIO and (skin / n) < PALE_SKIN_MAX_SKIN_RATIO
+
+
+_EXIF_FOCAL_LENGTH = 0x920A  # FocalLength
+_EXIF_FOCAL_35MM = 0xA405  # FocalLengthIn35mmFilm（优先，可直接判断焦段）
+
+
+def extract_focal_length(data: bytes) -> float | None:
+    """从 EXIF 读取实际焦距（mm）；优先 35mm 等效，回退原始焦距。无 EXIF/无焦距返回 None。"""
+    try:
+        exif = Image.open(io.BytesIO(data)).getexif()
+        if not exif:
+            return None
+        if _EXIF_FOCAL_35MM in exif:
+            value = exif[_EXIF_FOCAL_35MM]
+            if isinstance(value, (int, float)):
+                return float(value)
+        if _EXIF_FOCAL_LENGTH in exif:
+            value = exif[_EXIF_FOCAL_LENGTH]
+            if isinstance(value, (int, float)):
+                return float(value)
+    except Exception:
+        return None
+    return None
 
 
 def decode_image(

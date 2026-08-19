@@ -8,6 +8,7 @@ from photo_clinic.metadata import (
     decode_image,
     detect_pale_skin,
     downscale_image,
+    extract_focal_length,
     inspect_metadata,
 )
 from photo_clinic.prompts import (
@@ -29,6 +30,7 @@ from photo_clinic.schemas import (
     AiSuspicion,
     BranchReview,
     BranchReviewResult,
+    DimensionScore,
     PrecheckResult,
     ReviewRequest,
     ReviewResponse,
@@ -40,10 +42,11 @@ from photo_clinic.skills import SkillRegistry
 PRECHECK_MAX_TOKENS = 2048
 REVIEW_MAX_TOKENS = 4096
 METADATA_AI_CONFIDENCE = 0.99
-# 临界复核：置信度落在 [30,70] 区间，或判 ai 但置信不足 95% 时，
-# 带第一轮证据再复核一次（抑制边界样本上单次判定的随机翻转）
+# 临界复核：置信度落在 [30,70] 区间，或判 ai 但置信不足 98% 时，
+# 带第一轮证据再复核一次（抑制边界样本上单次判定的随机翻转；
+# 高置信 AI 也可能因「推理型怀疑」误判，98% 以下一律复核）
 RECHECK_CONF_LOW, RECHECK_CONF_HIGH = 30.0, 70.0
-RECHECK_AI_CONF_MAX = 95.0
+RECHECK_AI_CONF_MAX = 98.0
 # 分类复核：other 但置信不足 90% 时强制二选一复核（拒绝是硬动作，误拒比误收代价大）
 CLASSIFY_OTHER_MIN_CONF = 90.0
 
@@ -65,6 +68,8 @@ async def run_review(
     model = request.model or config.model
 
     flags = inspect_metadata(image)
+    # 实际焦距（EXIF）需在重编码前读取（downscale 会丢弃 EXIF）；无焦距则 None，走推断
+    focal_length = extract_focal_length(image.data)
     # 送 LLM 的图统一压到 ≤3000px/≤2MB（元数据检测已在此前完成；重编码会丢弃 EXIF 等证据），
     # 保留皮肤纹理细节供模型判断，同时限制单请求内存放大倍数，多轮调用复用同一份小图
     image = downscale_image(image)
@@ -77,7 +82,9 @@ async def run_review(
             metadata=flags,
             source="metadata",
         )
-        review, tokens = await _review_branch(llm, skills, image, "ai", model=model)
+        review, tokens = await _review_branch(
+            llm, skills, image, "ai", model=model, focal_length=focal_length
+        )
         _add_usage(usage, tokens)
         return ReviewResponse(
             route="ai",
@@ -114,7 +121,9 @@ async def run_review(
         source="llm",
     )
     if pre.is_ai == "ai":
-        review, tokens = await _review_branch(llm, skills, image, "ai", model=model)
+        review, tokens = await _review_branch(
+            llm, skills, image, "ai", model=model, focal_length=focal_length
+        )
         _add_usage(usage, tokens)
         return ReviewResponse(
             route="ai",
@@ -147,7 +156,9 @@ async def run_review(
             usage=usage,
         )
 
-    review, tokens = await _review_branch(llm, skills, image, pre.category, model=model)
+    review, tokens = await _review_branch(
+        llm, skills, image, pre.category, model=model, focal_length=focal_length
+    )
     _add_usage(usage, tokens)
     ai_suspicion = None
     # 仅置信度 ≥50% 才提示"疑似 AI"（低于此值视为普通照片，不出疑似点评）
@@ -174,6 +185,11 @@ MAJOR_DIMENSION_KEYWORDS = {
     "后期": ("肤色", "塑料", "液化", "色调", "皮肤", "后期"),
 }
 MAJOR_DIMENSION_CAP = 1.0  # 重大问题命中后，所属维度得分封顶（狠狠扣分）
+# 维度满分表（评分一致性校验用；ai 板块维度名不同，自动跳过）
+DIMENSION_MAX = {"构图": 3.0, "光线": 4.0, "后期": 3.0}
+# 每条扣分点自动降 0.5，最多降 1 分（防「写扣分点却给满分」绕过评分从严）
+PER_DEDUCTION_PENALTY = 0.5
+MAX_CONSISTENCY_PENALTY = 1.0
 # 磨皮/皮肤质感类问题不进重大问题（按用户定案：最多扣分点），命中即从 major_issues 中剔除
 TEXTURE_MAJOR_KEYWORDS = ("磨皮", "皮肤质感", "塑料感", "毛孔", "肌理")
 
@@ -191,24 +207,168 @@ def _strip_texture_major(result: BranchReviewResult) -> BranchReviewResult:
 
 
 SKIN_MAJOR_MESSAGE = "肤色异常：皮肤发白（偏白/惨白），缺乏血色，偏离真实人体肤色"
-PIXEL_SKIN_MAJOR_MESSAGE = "肤色异常：皮肤发白，缺乏血色（像素检测确认）"
 
 
-def _apply_skin_rule(result: BranchReviewResult) -> BranchReviewResult:
-    """肤色规则判定：模型在 skin_report 中只报告事实，是否重大问题由规则决定。
+# 评语元素词表（L4 冲突锁：出彩声明与同维度扣分点/重大问题说同一元素 = 既夸又贬）
+_REVIEW_ELEMENTS = (
+    "前景", "背景", "手部", "人物", "主体", "视角", "机位", "光线", "阴影",
+    "光比", "光影", "色彩", "色调", "皮肤", "头发", "发丝", "眼神光",
+    "轮廓光", "构图", "平衡", "层次", "裁切",
+)
 
-    阈值：肤色发白（pale/white）且不满足豁免（exempt=False）即构成重大问题
-    （cosplay/角色扮演不豁免）。命中且 major_issues 中尚无对应条目时补入标准文案。
+
+def _conflicting_element(note: str, sources: list[str]) -> str | None:
+    """出彩声明与同维度扣分点/重大问题是否说到同一元素，返回元素名或 None。"""
+    for element in _REVIEW_ELEMENTS:
+        if element in note and any(element in s for s in sources):
+            return element
+    return None
+
+
+def _major_dimension(result: BranchReviewResult) -> str | None:
+    """重大问题所属维度（按关键词映射；无匹配返回 None）。"""
+    for issue in result.major_issues:
+        for dim_name, keywords in MAJOR_DIMENSION_KEYWORDS.items():
+            if any(k in issue for k in keywords):
+                return dim_name
+    return None
+
+
+# 多层锁降分时写入的用户可读扣分点（不暴露内部机制，用评审语言说明降分原因）
+_DEDUCTION_NO_EXCEPTIONAL = "无突出出彩之处，未达满分标准"
+
+
+def _major_label(issue: str) -> str:
+    """提取重大问题短标签（冒号/逗号前的片段，最长 12 字），用于扣分点指明具体问题。"""
+    for sep in ("：", ":", "，", ","):
+        if sep in issue:
+            return issue.split(sep)[0][:12]
+    return issue[:12]
+
+
+def _append_deduction(dim: DimensionScore, text: str) -> None:
+    if text not in dim.deductions:
+        dim.deductions = [*dim.deductions, text]
+
+
+def _enforce_score_consistency(result: BranchReviewResult) -> BranchReviewResult:
+    """评分一致性校验（满分多层锁，全部由代码执行）：
+
+    L1 无瑕疵：写了扣分点却给满分 → 按扣分点数量降分（每条 0.5，最多 1）；
+    L2 出彩声明：无扣分点给满分但 exceptional_note 为空 → 降 0.5；
+    L4 冲突锁：出彩声明与任一扣分点/重大问题共享元素（≥2 字）→ 既夸又贬 → 降 0.5；
+    L3 背书锁：照片存在重大问题（major_issues 非空）时，其余维度满分须在
+       full_mark_endorsements 中被复核轮显式背书，未背书 → 降 0.5；
+    L5 复读锁：背书理由与出彩声明完全相同 → 视为复读糊弄，无效背书 → 降 0.5。
+
+    每次降分同步写入用户可读的扣分点（分数与扣分点保持一致）。
+    非满分维度不受影响；重大问题所属维度由封顶规则处理，不参与背书锁。
     """
-    report = result.skin_report
-    if report is None:
-        return result
-    severe = report.whiteness in ("pale", "white") and not report.exempt
-    if severe and not any("肤色" in issue or "发白" in issue for issue in result.major_issues):
-        return result.model_copy(
-            update={"major_issues": [*result.major_issues, SKIN_MAJOR_MESSAGE]}
-        )
+    changed = False
+    major_dim = _major_dimension(result) if result.major_issues else None
+    for dim in result.dimensions:
+        max_score = DIMENSION_MAX.get(dim.dimension)
+        if max_score is None or dim.score < max_score:
+            continue
+        if dim.deductions:
+            penalty = min(len(dim.deductions) * PER_DEDUCTION_PENALTY, MAX_CONSISTENCY_PENALTY)
+            dim.score = max(max_score - penalty, 0.0)
+            changed = True
+            continue
+        if not dim.exceptional_note:
+            dim.score = max(max_score - PER_DEDUCTION_PENALTY, 0.0)
+            _append_deduction(dim, _DEDUCTION_NO_EXCEPTIONAL)
+            changed = True
+            continue
+        # L4 冲突锁：出彩声明与同维度扣分点/重大问题说同一元素 → 既夸又贬
+        conflict_sources = list(dim.deductions)
+        if dim.dimension == major_dim:
+            conflict_sources.extend(result.major_issues)
+        element = _conflicting_element(dim.exceptional_note, conflict_sources)
+        if element:
+            dim.score = max(max_score - PER_DEDUCTION_PENALTY, 0.0)
+            dim.exceptional_note = None  # 撤销自相矛盾的出彩声明
+            _append_deduction(dim, f"{element}：评语前后矛盾（既肯定又指出其问题）")
+            changed = True
+            continue
+        if result.major_issues and dim.dimension != major_dim:
+            endorsement = result.full_mark_endorsements.get(dim.dimension)
+            if not endorsement or endorsement == dim.exceptional_note:
+                # 扣分点先写该板块自身的问题（复核轮给出的具体瑕疵），再附评分从严说明
+                critique = result.full_mark_critiques.get(dim.dimension) or "未达满分标准"
+                dim.score = max(max_score - PER_DEDUCTION_PENALTY, 0.0)
+                _append_deduction(
+                    dim,
+                    f"{critique}（照片存在重大问题（{_major_label(result.major_issues[0])}），其余维度评分从严）",
+                )
+                changed = True
+    if changed and result.total_score is not None:
+        result.total_score = sum(d.score for d in result.dimensions)
     return result
+
+
+# 输出术语黑名单：rubric 内部术语不得出现在点评输出中（服务端强制剔除）
+JARGON_TERMS = ("生命力四要素", "生命力要素", "动态的道具", "不确定的瞬间", "飞扬的发丝", "灵动的姿态")
+
+
+def _strip_jargon(result: BranchReviewResult) -> BranchReviewResult:
+    """从 bonus_notes 中剔除含内部术语的句子（术语禁令由代码强制执行）。"""
+    if not result.bonus_notes:
+        return result
+    kept = [
+        sentence.strip()
+        for sentence in result.bonus_notes.replace("；", "。").replace(";", "。").split("。")
+        if sentence.strip() and not any(term in sentence for term in JARGON_TERMS)
+    ]
+    cleaned = "。".join(kept)
+    if cleaned != result.bonus_notes:
+        return result.model_copy(update={"bonus_notes": cleaned or None})
+    return result
+
+
+# 焦段矛盾：建议中的焦段方向与画面透视特征冲突（压缩感=长焦特征、近大远小=广角特征）
+_FOCAL_WIDE_WORDS = ("广角", "稍广角", "更广角", "广角镜头")
+_FOCAL_TELE_WORDS = ("长焦", "更长焦", "长焦镜头")
+_FOCAL_COMPRESSION = ("压缩感", "压缩背景", "扁平", "空间压缩")
+_FOCAL_PERSPECTIVE = ("近大远小", "透视拉伸", "强烈透视", "透视夸张")
+
+
+def _filter_focal_advice(
+    result: BranchReviewResult, focal_mm: float | None = None
+) -> BranchReviewResult:
+    """剔除焦段方向错误的改进建议。
+
+    实际焦距（EXIF）已知时：建议断言与实际焦距相反的焦段 → 剔除（如长焦图建议广角）。
+    焦距未知时：剔除自相矛盾的建议（「有压缩感却建议广角」等内部矛盾）。
+    """
+    if focal_mm is not None:
+        is_wide = focal_mm <= 35
+        is_tele = focal_mm > 70
+    else:
+        is_wide = is_tele = None
+
+    def _bad(item) -> bool:
+        suggestion = item.suggestion
+        if any(w in suggestion for w in _FOCAL_WIDE_WORDS):
+            if is_wide is False:  # 实际非广角（标准或长焦）却建议广角
+                return True
+            if is_wide is None and any(c in suggestion for c in _FOCAL_COMPRESSION):
+                return True
+        if any(w in suggestion for w in _FOCAL_TELE_WORDS):
+            if is_tele is False:  # 实际非长焦（标准或广角）却建议长焦
+                return True
+            if is_tele is None and any(p in suggestion for p in _FOCAL_PERSPECTIVE):
+                return True
+        return False
+
+    changed = False
+    for group in ("pre_shooting", "post_processing"):
+        items = list(getattr(result.improvements, group))
+        kept = [item for item in items if not _bad(item)]
+        if len(kept) != len(items):
+            result.improvements = result.improvements.model_copy(update={group: kept})
+            changed = True
+    return result if changed else result
 
 
 def _apply_major_score_cap(result: BranchReviewResult) -> BranchReviewResult:
@@ -240,9 +400,10 @@ async def _review_branch(
     route: str,
     *,
     model: str,
+    focal_length: float | None = None,
 ) -> tuple[BranchReview, tuple[int, int]]:
     result, in_tokens, out_tokens = await llm.structured_call(
-        system=build_review_system(skills, route),
+        system=build_review_system(skills, route, focal_length),
         image=image,
         user_text=REVIEW_USER_TEXT,
         schema=BranchReviewResult,
@@ -250,16 +411,19 @@ async def _review_branch(
         step="review",
         model=model,
     )
-    # 人物板块重大问题复核：首轮自评存在不确定方面（possible_issues 非空）、或任一维度
-    # 有扣分点（说明画面存在瑕疵，值得复核）时触发一轮复核，一次性覆盖全部可能问题；
-    # 复核为终轮，不再递归触发。单轮 LLM 视觉判断有波动（肤色/磨皮判定偶发漏判），
-    # 复核轮判出重大问题时按更严格结论（复核轮）整体替换；复核轮无则沿用第一轮。
-    # 完全无瑕疵且无不确定项的图跳过复核，省一次调用。其余板块无重大问题语义。
+    # 人物板块重大问题复核：首轮自评存在不确定方面（possible_issues 非空）、任一维度
+    # 有扣分点、或任一维度给满分（满分须两轮一致，防单轮虚高）时触发一轮复核，
+    # 一次性覆盖全部可能问题；复核为终轮，不再递归触发。
+    # 复核轮判出重大问题时按更严格结论（复核轮）整体替换；否则并入复核轮发现的额外
+    # 扣分点（更严格），完全无瑕疵且无不确定项的图跳过复核，省一次调用。
+    # 其余板块无重大问题语义。
     if route == "portrait" and (
-        result.possible_issues or any(d.deductions for d in result.dimensions)
+        result.possible_issues
+        or any(d.deductions for d in result.dimensions)
+        or any(d.score >= DIMENSION_MAX.get(d.dimension, 0.0) for d in result.dimensions)
     ):
         recheck, in2, out2 = await llm.structured_call(
-            system=build_recheck_review_system(skills, route, result),
+            system=build_recheck_review_system(skills, route, result, focal_length),
             image=image,
             user_text=REVIEW_RECHECK_USER_TEXT,
             schema=BranchReviewResult,
@@ -271,16 +435,40 @@ async def _review_branch(
         out_tokens += out2
         if recheck.major_issues:
             result = recheck
+        else:
+            # 并入复核轮发现的额外扣分点（按更严格结论合并）
+            dims = {d.dimension: d for d in result.dimensions}
+            changed = False
+            for d in recheck.dimensions:
+                if d.dimension in dims and d.deductions:
+                    extra = [x for x in d.deductions if x not in dims[d.dimension].deductions]
+                    if extra:
+                        dims[d.dimension] = dims[d.dimension].model_copy(
+                            update={"deductions": [*dims[d.dimension].deductions, *extra]}
+                        )
+                        changed = True
+            if changed:
+                result = result.model_copy(update={"dimensions": list(dims.values())})
     result = _strip_texture_major(result)
-    result = _apply_skin_rule(result)
-    # 像素级肤色兜底：模型报告可能漂移（同图时而 natural 时而 pale），
-    # 像素检测是确定性的——发白即判重大问题，不依赖模型感知
-    if route == "portrait" and detect_pale_skin(image) and not any(
-        "肤色" in issue or "发白" in issue for issue in result.major_issues
-    ):
-        result = result.model_copy(
-            update={"major_issues": [*result.major_issues, PIXEL_SKIN_MAJOR_MESSAGE]}
-        )
+    result = _strip_jargon(result)
+    result = _filter_focal_advice(result, focal_length)
+    # 肤色重大问题以像素检测为唯一权威（双向门控）：模型自写/规则注入的肤色重大
+    # 都需像素确认，未确认则剔除（防蓝光/冷调场景误报，如 5.jpg）；确认则确保有标准文案
+    if route == "portrait":
+        if detect_pale_skin(image):
+            if not any("肤色" in issue or "发白" in issue for issue in result.major_issues):
+                result = result.model_copy(
+                    update={"major_issues": [*result.major_issues, SKIN_MAJOR_MESSAGE]}
+                )
+        else:
+            kept = [
+                issue
+                for issue in result.major_issues
+                if not ("肤色" in issue or "发白" in issue)
+            ]
+            if len(kept) != len(result.major_issues):
+                result = result.model_copy(update={"major_issues": kept})
+    result = _enforce_score_consistency(result)
     result = _apply_major_score_cap(result)
     review = BranchReview(
         skill=ROUTE_TO_SKILL[route],

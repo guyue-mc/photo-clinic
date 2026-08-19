@@ -39,9 +39,11 @@ def build_recheck_system(
         f"第一轮证据：\n{evidence}\n"
         "请重点审查：上述证据是否可以用重度后期（磨皮、液化、精修）解释？"
         "注意以下线索属于弱证据，不能单独支撑 ai：皮肤平滑/蜡质、发丝规整或波浪分层、"
-        "软地面无压痕、柔和光下的阴影方向、指尖轻微僵硬或融化感。"
+        "软地面无压痕、柔和光下的阴影方向、指尖轻微僵硬或融化感、衣物边缘过度平滑。"
         "判 ai 必须有两类以上实锤级结构性破绽（多余手指/指节错位、文字乱码、"
-        "多方向硬阴影矛盾、透视崩坏、重力违规）。重新逐项审查并给出最终结论。"
+        "多方向硬阴影矛盾、透视崩坏、重力违规）。缺失类观察不是证据（看不到玻璃/支撑/反光"
+        "不等于不存在）；特殊拍摄环境（水族馆、玻璃幕墙、镜面、水下、灯光秀、烟雾）中的"
+        "透视反光阴影差异多为环境特性，不能作为 AI 证据。重新逐项审查并给出最终结论。"
     )
     return build_precheck_system(registry, flags) + appendix
 
@@ -58,13 +60,33 @@ def build_reclassify_system(
     return build_precheck_system(registry, flags) + appendix
 
 
-def build_review_system(registry: SkillRegistry, route: str) -> str:
+def focal_hint(mm: float | None) -> str:
+    """实际焦距（EXIF）作为数据注入：模型必须按真实焦段描述，不得断言相反焦段。"""
+    if mm is None:
+        return ""
+    if mm <= 35:
+        label = "广角（≤35mm）"
+    elif mm <= 70:
+        label = "人眼/标准焦段（35-70mm）"
+    else:
+        label = "长焦（>70mm）"
+    return (
+        f"图片实际焦距（EXIF）：{mm:g}mm，即{label}。"
+        "评语与建议中的焦段描述必须与实际焦距一致，不得断言与实际焦距相反的焦段；"
+        "边缘变形按使用问题（人物偏位）处理，不改变焦段结论。"
+    )
+
+
+def build_review_system(registry: SkillRegistry, route: str, mm: float | None = None) -> str:
     parts = [BASE_PREAMBLE, registry.get(ROUTE_TO_SKILL[route]).body]
+    hint = focal_hint(mm)
+    if hint:
+        parts.append(hint)
     return "\n\n".join(parts)
 
 
 def build_recheck_review_system(
-    registry: SkillRegistry, route: str, first: BranchReviewResult
+    registry: SkillRegistry, route: str, first: BranchReviewResult, mm: float | None = None
 ) -> str:
     """板块评审复核：把第一轮结论作为数据附上，重点复核重大问题是否漏判。
 
@@ -81,7 +103,12 @@ def build_recheck_review_system(
         f"第一轮扣分点：{deductions}\n"
         f"第一轮认为以下方面可能存在重大问题：{('、'.join(first.possible_issues)) or '（未标注）'}\n"
         "请按 rubric 第 0 节逐项重新独立排查，重点复核上述标注方面与扣分点对应的方面"
-        "（涉及肤色/皮肤质感时核查豁免条款是否被滥用），其余各项顺带复查，"
+        "（涉及肤色/皮肤质感时核查豁免条款是否被滥用），其余各项顺带复查。"
+        "若第一轮某维度给了满分，请重点复核该维度是否漏判了瑕疵（满分须两轮一致），"
+        "并在 full_mark_endorsements 中为每个确认无误的满分维度显式背书"
+        "（键=维度名，值=背书理由，须写明该维度具体出彩之处与已排查项）；"
+        "无法背书的满分维度，必须在 full_mark_critiques 中写明该维度具体存在的问题或瑕疵"
+        "（具体、可指认，不得空泛）；存在重大问题时，其余维度的满分须更严格核查。"
         "一次性给出完整复核结论。复核结论独立给出，可与第一轮不同；"
         "复核输出不会再次触发复核。"
     )

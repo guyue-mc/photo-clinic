@@ -39,6 +39,42 @@ def test_detect_pale_skin_ok_for_dark_background():
     # 深色背景（无人脸信息）不应误判
     assert detect_pale_skin(_decoded_from_rgb(400, 400, (30, 60, 90))) is False
 
+
+def test_extract_focal_length_from_exif():
+    from photo_clinic.metadata import extract_focal_length
+
+    buf = io.BytesIO()
+    img = Image.new("RGB", (64, 64), (200, 150, 100))
+    exif = Image.Exif()
+    exif[0x920A] = 50  # FocalLength
+    img.save(buf, format="JPEG", exif=exif)
+    assert extract_focal_length(buf.getvalue()) == 50.0
+
+
+def test_extract_focal_length_prefers_35mm():
+    from photo_clinic.metadata import extract_focal_length
+
+    buf = io.BytesIO()
+    img = Image.new("RGB", (64, 64), (200, 150, 100))
+    exif = Image.Exif()
+    exif[0x920A] = 24  # 原始焦距
+    exif[0xA405] = 35  # 35mm 等效
+    img.save(buf, format="JPEG", exif=exif)
+    assert extract_focal_length(buf.getvalue()) == 35.0
+
+
+def test_extract_focal_length_none_without_exif(jpeg_image):
+    from photo_clinic.metadata import extract_focal_length
+
+    import base64
+
+    assert extract_focal_length(base64.b64decode(jpeg_image)) is None
+
+
+def test_detect_pale_skin_skips_blue_dominant_scene():
+    # 蓝色主导（水体/天空/水族馆）场景跳过判定，防水误报
+    assert detect_pale_skin(_decoded_from_rgb(400, 400, (40, 120, 190))) is False
+
 MAX = 10 * 1024 * 1024
 
 

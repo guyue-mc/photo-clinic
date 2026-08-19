@@ -15,19 +15,15 @@ from photo_clinic.config import Config
 from photo_clinic.metadata import InvalidMediaTypeError
 from photo_clinic.pipeline import (
     MAJOR_DIMENSION_CAP,
-    PIXEL_SKIN_MAJOR_MESSAGE,
+    SKIN_MAJOR_MESSAGE,
     _apply_major_score_cap,
-    _apply_skin_rule,
+    _enforce_score_consistency,
+    _filter_focal_advice,
+    _strip_jargon,
     _strip_texture_major,
     run_review,
 )
-from photo_clinic.schemas import (
-    BranchReviewResult,
-    DimensionScore,
-    ReviewRequest,
-    SkinReport,
-    TextureReport,
-)
+from photo_clinic.schemas import BranchReviewResult, DimensionScore, ReviewRequest, TextureReport
 
 
 def make_config(tmp_path) -> Config:
@@ -78,11 +74,11 @@ async def test_route_portrait(skills, jpeg_image, tmp_path, fake_provider):
 
 
 REVIEW_POSSIBLE = {**REVIEW, "possible_issues": ["肤色"]}
-REVIEW_CLEAN = {**REVIEW, "dimensions": [{"dimension": "构图", "score": 8.0, "comment": "尚可"}]}
+REVIEW_CLEAN = {**REVIEW, "dimensions": [{"dimension": "构图", "score": 2.5, "comment": "尚可"}]}
 REVIEW_WITH_MAJOR = {
     **REVIEW_CLEAN,
     "total_score": 6.0,
-    "major_issues": ["人物肤色发白发青，色温偏差导致偏离真实人体肤色"],
+    "major_issues": ["曝光硬伤：窗外大面积过曝死白，主体细节丢失"],
 }
 
 
@@ -115,6 +111,36 @@ async def test_portrait_recheck_agreement_keeps_first(
     assert len(rev_calls) == 2
     assert resp.review.major_issues == []
     assert resp.review.total_score == 7.5
+
+
+async def test_portrait_full_score_triggers_recheck_and_merges_deductions(
+    skills, jpeg_image, tmp_path, fake_provider
+):
+    # 满分须两轮一致：首轮构图 3.0 满分，复核轮发现扣分点 → 并入并自动降分
+    first = {
+        **REVIEW_CLEAN,
+        "dimensions": [
+            {"dimension": "构图", "score": 3.0, "comment": "无可指摘", "deductions": []},
+            {"dimension": "光线", "score": 3.0, "comment": "尚可", "deductions": []},
+            {"dimension": "后期", "score": 2.0, "comment": "尚可", "deductions": []},
+        ],
+    }
+    second = {
+        **first,
+        "dimensions": [
+            {"dimension": "构图", "score": 3.0, "comment": "复核", "deductions": ["前景手部遮挡过重"]},
+            {"dimension": "光线", "score": 3.0, "comment": "尚可", "deductions": []},
+            {"dimension": "后期", "score": 2.0, "comment": "尚可", "deductions": []},
+        ],
+    }
+    fake_provider.script("precheck", PRECHECK_PORTRAIT).script("review", [first, second])
+    resp = await run(skills, tmp_path, fake_provider, ReviewRequest(image_base64=jpeg_image))
+    rev_calls = [c for c in fake_provider.calls if c["step"] == "review"]
+    assert len(rev_calls) == 2
+    comp = next(d for d in resp.review.dimensions if d.dimension == "构图")
+    assert "前景手部遮挡过重" in comp.deductions
+    assert comp.score == 2.5  # 一致性校验自动降分
+    assert resp.review.total_score == 2.5 + 3.0 + 2.0
 
 
 async def test_portrait_recheck_skipped_when_clean_first_round(
@@ -195,7 +221,7 @@ async def test_portrait_pixel_skin_rule_catches_when_model_reports_natural(
     fake_provider.script("precheck", PRECHECK_PORTRAIT).script("review", REVIEW_CLEAN)
     resp = await run(skills, tmp_path, fake_provider, ReviewRequest(image_base64=pale_image))
     assert resp.route == "portrait"
-    assert PIXEL_SKIN_MAJOR_MESSAGE in resp.review.major_issues
+    assert SKIN_MAJOR_MESSAGE in resp.review.major_issues
 
 
 async def test_portrait_pixel_skin_rule_skips_warm_skin(
@@ -216,6 +242,24 @@ async def test_portrait_pixel_skin_rule_skips_warm_skin(
     assert resp.review.major_issues == []
 
 
+async def test_portrait_skin_major_stripped_when_pixel_not_confirmed(
+    skills, tmp_path, fake_provider
+):
+    # 模型自写肤色重大但像素未确认（蓝光/冷调场景）→ 剔除，像素为唯一权威
+    import base64
+    import io
+
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.new("RGB", (400, 400), (205, 155, 115)).save(buf, format="JPEG")
+    warm_image = base64.b64encode(buf.getvalue()).decode()
+    model_wrote = {**REVIEW_CLEAN, "major_issues": ["肤色发白，缺乏血色，构成重大问题"]}
+    fake_provider.script("precheck", PRECHECK_PORTRAIT).script("review", model_wrote)
+    resp = await run(skills, tmp_path, fake_provider, ReviewRequest(image_base64=warm_image))
+    assert resp.review.major_issues == []
+
+
 def make_result(**kw) -> BranchReviewResult:
     return BranchReviewResult(total_score=7.0, dimensions=[], **kw)
 
@@ -231,35 +275,62 @@ def test_strip_texture_major_removes_retouch_keeps_others():
     assert updated.major_issues == ["肤色在冷光环境下偏青白，属异常处理"]
 
 
+def test_strip_jargon_removes_internal_terms():
+    result = make_result(
+        bonus_notes=(
+            "模特表现力强。具备『生命力四要素』中的动态与不确定瞬间。"
+            "手部前伸与血迹增强了叙事与互动感。妆造精致。"
+        )
+    )
+    updated = _strip_jargon(result)
+    assert "生命力四要素" not in updated.bonus_notes
+    assert "不确定的瞬间" not in updated.bonus_notes
+    assert "手部前伸与血迹增强了叙事与互动感" in updated.bonus_notes
+    assert "妆造精致" in updated.bonus_notes  # 正常词汇不受影响
+
+
+def test_filter_focal_advice_drops_contradiction():
+    # 焦距未知时：剔除内部矛盾建议（压缩感+建议广角；近大远小+建议长焦）
+    from photo_clinic.schemas import Improvement, StageAdvice
+
+    result = make_result()
+    result.improvements = StageAdvice(
+        pre_shooting=[
+            Improvement(aspect="焦段", suggestion="当前焦段呈现较强压缩感，可尝试使用稍广角镜头增强纵深"),
+            Improvement(aspect="站位", suggestion="让人物居中避免贴边"),
+        ],
+        post_processing=[
+            Improvement(aspect="透视", suggestion="近大远小明显，可尝试长焦镜头压缩"),
+        ],
+    )
+    updated = _filter_focal_advice(result)
+    kept = [i.suggestion for i in updated.improvements.pre_shooting]
+    assert kept == ["让人物居中避免贴边"]
+    assert updated.improvements.post_processing == []
+
+
+def test_filter_focal_advice_with_known_focal_length():
+    # 实际焦距已知（长焦 135mm）：建议广角 → 剔除；建议长焦 → 保留
+    from photo_clinic.schemas import Improvement, StageAdvice
+
+    result = make_result()
+    result.improvements = StageAdvice(
+        pre_shooting=[
+            Improvement(aspect="焦段", suggestion="建议改用广角镜头增强透视张力"),
+            Improvement(aspect="焦段", suggestion="可继续使用长焦压缩背景，突出主体"),
+        ],
+        post_processing=[],
+    )
+    updated = _filter_focal_advice(result, focal_mm=135.0)
+    kept = [i.suggestion for i in updated.improvements.pre_shooting]
+    assert kept == ["可继续使用长焦压缩背景，突出主体"]
+
+
 def test_strip_texture_major_keeps_unrelated_issues():
     result = make_result(major_issues=["曝光硬伤：窗外大面积过曝死白"])
     assert _strip_texture_major(result) is result
 
 
-def test_skin_rule_injects_major_when_pale_or_white():
-    for whiteness in ("pale", "white"):
-        result = make_result(skin_report=SkinReport(whiteness=whiteness, exempt=False))
-        updated = _apply_skin_rule(result)
-        assert len(updated.major_issues) == 1
-        assert "肤色异常" in updated.major_issues[0]
-
-
-def test_skin_rule_skips_natural_or_exempt():
-    for rep in (
-        SkinReport(whiteness="natural", exempt=False),
-        SkinReport(whiteness="white", exempt=True),  # 非人类色/强风格化豁免
-    ):
-        updated = _apply_skin_rule(make_result(skin_report=rep))
-        assert updated.major_issues == []
-
-
-def test_skin_rule_no_duplicate_when_model_already_flagged():
-    result = make_result(
-        major_issues=["肤色在冷光环境下偏青白，属异常处理"],
-        skin_report=SkinReport(whiteness="pale", exempt=False),
-    )
-    updated = _apply_skin_rule(result)
-    assert updated.major_issues == ["肤色在冷光环境下偏青白，属异常处理"]
 
 
 def scored_result(total: float, *dims) -> BranchReviewResult:
@@ -293,6 +364,137 @@ def test_major_score_cap_maps_exposure_to_lighting():
     updated = _apply_major_score_cap(result)
     light = next(d for d in updated.dimensions if d.dimension == "光线")
     assert light.score == MAJOR_DIMENSION_CAP
+
+
+def test_score_consistency_lowers_full_marks_with_deductions():
+    # 写了扣分点却给满分 → 代码自动降分（每条 0.5，最多 1）
+    result = scored_result(
+        10.0,
+        DimensionScore(dimension="构图", score=3.0, comment="x", deductions=["前景杂乱"]),
+        DimensionScore(dimension="光线", score=4.0, comment="x", deductions=["边缘略硬", "光比偏大"]),
+        DimensionScore(dimension="后期", score=3.0, comment="x", exceptional_note="影调层次出色"),
+    )
+    updated = _enforce_score_consistency(result)
+    dims = {d.dimension: d.score for d in updated.dimensions}
+    assert dims["构图"] == 2.5  # 1 条扣分点 → -0.5
+    assert dims["光线"] == 3.0  # 2 条 → -1（封顶降幅）
+    assert dims["后期"] == 3.0  # 有出彩声明 → 不动
+    assert updated.total_score == 2.5 + 3.0 + 3.0
+
+
+def test_score_consistency_full_marks_need_exceptional_note():
+    # 无瑕疵给满分但缺出彩声明 → 降 0.5（满分 = 无瑕疵 + 出彩）
+    result = scored_result(
+        10.0,
+        DimensionScore(dimension="构图", score=3.0, comment="x"),
+        DimensionScore(dimension="光线", score=4.0, comment="x"),
+        DimensionScore(dimension="后期", score=3.0, comment="x"),
+    )
+    updated = _enforce_score_consistency(result)
+    dims = {d.dimension: d.score for d in updated.dimensions}
+    assert dims == {"构图": 2.5, "光线": 3.5, "后期": 2.5}
+    assert updated.total_score == 2.5 + 3.5 + 2.5
+
+
+def test_score_consistency_endorsement_lock_for_major_photos():
+    # 重大问题照片：其余维度满分须复核轮显式背书，未背书 → 降 0.5，
+    # 扣分点写明具体瑕疵 + 重大问题标签
+    result = scored_result(
+        10.0,
+        DimensionScore(dimension="构图", score=3.0, comment="x", exceptional_note="仰拍出彩"),
+        DimensionScore(dimension="光线", score=4.0, comment="x", exceptional_note="光效出色"),
+        DimensionScore(dimension="后期", score=3.0, comment="x", exceptional_note="影调统一"),
+    )
+    result.major_issues = ["肤色惨白，缺乏血色，构成重大问题"]
+    result.full_mark_critiques = {"构图": "前景手部遮挡过重，主体表现受干扰"}
+    updated = _enforce_score_consistency(result)
+    dims = {d.dimension: d.score for d in updated.dimensions}
+    assert dims["构图"] == 2.5  # 未背书 → -0.5
+    assert dims["光线"] == 3.5
+    assert dims["后期"] == 3.0  # 重大问题所属维度走封顶规则，不受背书锁影响
+    comp = next(d for d in updated.dimensions if d.dimension == "构图")
+    assert any(
+        "前景手部遮挡过重" in d and "肤色惨白" in d for d in comp.deductions
+    )  # 先写板块自身问题，再附重大问题标签
+
+
+def test_score_consistency_conflict_lock_same_dimension():
+    # 冲突锁（同维度）：出彩声明与同维度重大问题说同一元素（主体）→ 降 0.5，
+    # 扣分点写具体元素，且自相矛盾的出彩声明被撤销
+    result = scored_result(
+        10.0,
+        DimensionScore(dimension="构图", score=3.0, comment="x", exceptional_note="主体居中出彩"),
+        DimensionScore(dimension="光线", score=4.0, comment="x", exceptional_note="光效出色"),
+        DimensionScore(dimension="后期", score=3.0, comment="x", exceptional_note="影调统一"),
+    )
+    result.major_issues = ["构图硬伤：主体被切断，画面不完整"]
+    updated = _enforce_score_consistency(result)
+    comp = next(d for d in updated.dimensions if d.dimension == "构图")
+    assert comp.score == 2.5
+    assert any("主体" in d for d in comp.deductions)
+    assert comp.exceptional_note is None
+
+
+def test_score_consistency_conflict_lock_cross_dimension_not_conflict():
+    # 跨维度说同一元素不算矛盾（构图夸手部引导、后期批手部颜色，属合理评审）
+    result = scored_result(
+        9.0,
+        DimensionScore(dimension="构图", score=3.0, comment="x", exceptional_note="前景手部引导出彩"),
+        DimensionScore(dimension="光线", score=3.5, comment="x", deductions=["阴影生硬"]),
+        DimensionScore(
+            dimension="后期", score=2.5, comment="x", deductions=["前景手部红色斑点突兀"]
+        ),
+    )
+    updated = _enforce_score_consistency(result)
+    comp = next(d for d in updated.dimensions if d.dimension == "构图")
+    assert comp.score == 3.0  # 跨维度不触发冲突锁
+
+
+def test_score_consistency_endorsement_lock_passes_when_endorsed():
+    # 复核轮显式背书 → 满分保留
+    result = scored_result(
+        10.0,
+        DimensionScore(dimension="构图", score=3.0, comment="x", exceptional_note="仰拍出彩"),
+        DimensionScore(dimension="光线", score=4.0, comment="x", exceptional_note="光效出色"),
+        DimensionScore(dimension="后期", score=3.0, comment="x", exceptional_note="影调统一"),
+    )
+    result.major_issues = ["肤色惨白，缺乏血色，构成重大问题"]
+    result.full_mark_endorsements = {
+        "构图": "低机位仰拍+前景引导线，复核确认无瑕疵且出彩",
+        "光线": "侧逆光+斑驳光影，复核确认无瑕疵且出彩",
+    }
+    updated = _enforce_score_consistency(result)
+    dims = {d.dimension: d.score for d in updated.dimensions}
+    assert dims["构图"] == 3.0
+    assert dims["光线"] == 4.0
+
+
+def test_score_consistency_copycat_endorsement_invalid():
+    # 复读锁：背书理由与出彩声明完全相同 → 无效背书 → 降 0.5
+    result = scored_result(
+        10.0,
+        DimensionScore(dimension="构图", score=3.0, comment="x", exceptional_note="仰拍出彩"),
+        DimensionScore(dimension="光线", score=4.0, comment="x", exceptional_note="光效出色"),
+        DimensionScore(dimension="后期", score=3.0, comment="x", exceptional_note="影调统一"),
+    )
+    result.major_issues = ["肤色惨白，缺乏血色，构成重大问题"]
+    result.full_mark_endorsements = {"构图": "仰拍出彩", "光线": "侧逆光复核确认"}  # 构图是复读
+    updated = _enforce_score_consistency(result)
+    dims = {d.dimension: d.score for d in updated.dimensions}
+    assert dims["构图"] == 2.5  # 复读背书无效 → -0.5
+    assert dims["光线"] == 4.0  # 真实背书 → 保留
+
+
+def test_score_consistency_skips_non_full_marks():
+    # 非满分维度不受影响
+    result = scored_result(
+        8.0,
+        DimensionScore(dimension="构图", score=2.5, comment="x", deductions=["前景杂乱"]),
+        DimensionScore(dimension="光线", score=3.5, comment="x"),
+        DimensionScore(dimension="后期", score=2.0, comment="x"),
+    )
+    updated = _enforce_score_consistency(result)
+    assert updated.total_score == 8.0
 
 
 def test_major_score_cap_noop_without_major_issues():
@@ -533,6 +735,21 @@ async def test_confident_ai_skips_recheck(skills, jpeg_image, tmp_path, fake_pro
     resp = await run(skills, tmp_path, fake_provider, ReviewRequest(image_base64=jpeg_image))
     assert len([c for c in fake_provider.calls if c["step"] == "precheck"]) == 1
     assert resp.route == "ai"
+
+
+async def test_high_confidence_ai_still_rechecks_below_98(
+    skills, jpeg_image, tmp_path, fake_provider
+):
+    # 95% 的 ai 判定也触发复核（推理型怀疑可能高置信误判，如 6.jpg 案例）
+    first = {**PRECHECK_AI, "ai_confidence": 95}
+    second = {**PRECHECK_LANDSCAPE, "ai_confidence": 5}
+    fake_provider.script("precheck", [first, second]).script("review", REVIEW)
+    resp = await run(skills, tmp_path, fake_provider, ReviewRequest(image_base64=jpeg_image))
+    pre_calls = [c for c in fake_provider.calls if c["step"] == "precheck"]
+    assert len(pre_calls) == 3  # 预检 + AI 复核 + 分类复核（首轮 other 低置信）
+    # 两轮分歧 → uncertain（均值 50），按题材路由到 landscape
+    assert resp.ai_detection.verdict == "uncertain"
+    assert resp.route == "landscape"
 
 
 async def test_not_ai_skips_recheck(skills, jpeg_image, tmp_path, fake_provider):

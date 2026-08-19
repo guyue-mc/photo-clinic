@@ -38,7 +38,7 @@ def skills(tmp_path: Path) -> SkillRegistry:
 # 预检/评审的脚本化 LLM 响应（test_pipeline 与 test_api 共用）
 PRECHECK_AI = {
     "is_ai": "ai",
-    "ai_confidence": 97,
+    "ai_confidence": 99,  # 高于复核阈值 98，路由类测试只走一次预检
     "ai_evidence": [{"aspect": "hand_anatomy", "finding": "六根手指", "supports_ai": True}],
     "category": "other",
     "category_confidence": 0,
@@ -65,7 +65,7 @@ PRECHECK_UNCERTAIN_LANDSCAPE = {
 REVIEW = {
     "total_score": 7.5,
     "dimensions": [
-        {"dimension": "构图", "score": 8.0, "comment": "尚可", "deductions": ["地平线歪斜"]}
+        {"dimension": "构图", "score": 2.5, "comment": "尚可", "deductions": ["地平线歪斜"]}
     ],
     "improvements": {
         "pre_shooting": [{"aspect": "机位", "suggestion": "低机位仰拍"}],
