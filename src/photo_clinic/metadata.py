@@ -86,6 +86,48 @@ LLM_IMAGE_MAX_BYTES = 2 * 1024 * 1024
 # 硬上限 = max_bytes 的 5 倍（防内存 DoS；自动压缩只在硬上限以内生效）
 _HARD_LIMIT_MULTIPLIER = 5
 
+# ===== 皮肤发白像素检测（确定性判定，不依赖 LLM 感知）=====
+# 采样区域：画面中央偏上（人脸最可能出现的位置），长宽各取 40%
+_FACE_CROP = (0.30, 0.15, 0.70, 0.55)
+# 正常肤色像素：红-黄色相、中等饱和、非暗部
+_SKIN_HUE_MAX, _SKIN_HUE_MIN = 30, 235  # HSV 0-255 刻度下的红-黄区间
+_SKIN_SAT_MIN, _SKIN_SAT_MAX = 38, 166  # S 0.15~0.65
+_SKIN_VAL_MIN = 102  # V > 0.4
+# 发白像素：低饱和 + 高亮（白到不真实）
+_WHITE_SAT_MAX = 77  # S < 0.3
+_WHITE_VAL_MIN = 191  # V > 0.75
+# 判定阈值：发白像素占比高 且 正常肤色占比低 → 皮肤发白
+PALE_SKIN_WHITE_RATIO = 0.15
+PALE_SKIN_MAX_SKIN_RATIO = 0.30
+
+
+def detect_pale_skin(img: DecodedImage) -> bool:
+    """像素级肤色发白检测：发白像素占比 > 15% 且 正常肤色像素占比 < 30% 即判定。
+
+    发白皮肤（青白/灰白/惨白）低饱和高亮，几乎不落在正常肤色区间；
+    正常皮肤（含暖调、健康肤色）占据采样区大部。阈值经 1.jpg/2.jpg 实测校准。
+    """
+    w, h = img.width, img.height
+    crop = (
+        Image.open(io.BytesIO(img.data))
+        .convert("RGB")
+        .crop((int(w * _FACE_CROP[0]), int(h * _FACE_CROP[1]), int(w * _FACE_CROP[2]), int(h * _FACE_CROP[3])))
+        .resize((200, 150))
+        .convert("HSV")
+    )
+    px = list(crop.getdata())
+    if not px:
+        return False
+    skin = 0
+    white = 0
+    for hh, ss, vv in px:
+        if vv > _SKIN_VAL_MIN and _SKIN_SAT_MIN < ss < _SKIN_SAT_MAX and (hh <= _SKIN_HUE_MAX or hh >= _SKIN_HUE_MIN):
+            skin += 1
+        if ss < _WHITE_SAT_MAX and vv > _WHITE_VAL_MIN:
+            white += 1
+    n = len(px)
+    return (white / n) > PALE_SKIN_WHITE_RATIO and (skin / n) < PALE_SKIN_MAX_SKIN_RATIO
+
 
 def decode_image(
     image_base64: str, max_bytes: int, *, auto_compress: bool = False

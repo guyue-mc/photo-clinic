@@ -6,6 +6,7 @@ from photo_clinic.metadata import (
     DecodedImage,
     InvalidMediaTypeError,
     decode_image,
+    detect_pale_skin,
     downscale_image,
     inspect_metadata,
 )
@@ -190,6 +191,7 @@ def _strip_texture_major(result: BranchReviewResult) -> BranchReviewResult:
 
 
 SKIN_MAJOR_MESSAGE = "肤色异常：皮肤发白（偏白/惨白），缺乏血色，偏离真实人体肤色"
+PIXEL_SKIN_MAJOR_MESSAGE = "肤色异常：皮肤发白，缺乏血色（像素检测确认）"
 
 
 def _apply_skin_rule(result: BranchReviewResult) -> BranchReviewResult:
@@ -271,6 +273,14 @@ async def _review_branch(
             result = recheck
     result = _strip_texture_major(result)
     result = _apply_skin_rule(result)
+    # 像素级肤色兜底：模型报告可能漂移（同图时而 natural 时而 pale），
+    # 像素检测是确定性的——发白即判重大问题，不依赖模型感知
+    if route == "portrait" and detect_pale_skin(image) and not any(
+        "肤色" in issue or "发白" in issue for issue in result.major_issues
+    ):
+        result = result.model_copy(
+            update={"major_issues": [*result.major_issues, PIXEL_SKIN_MAJOR_MESSAGE]}
+        )
     result = _apply_major_score_cap(result)
     review = BranchReview(
         skill=ROUTE_TO_SKILL[route],

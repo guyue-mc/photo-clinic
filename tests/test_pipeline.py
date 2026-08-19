@@ -15,6 +15,7 @@ from photo_clinic.config import Config
 from photo_clinic.metadata import InvalidMediaTypeError
 from photo_clinic.pipeline import (
     MAJOR_DIMENSION_CAP,
+    PIXEL_SKIN_MAJOR_MESSAGE,
     _apply_major_score_cap,
     _apply_skin_rule,
     _strip_texture_major,
@@ -177,6 +178,42 @@ async def test_non_portrait_review_skips_recheck(
     rev_calls = [c for c in fake_provider.calls if c["step"] == "review"]
     assert len(rev_calls) == 1
     assert resp.route == "landscape"
+
+
+async def test_portrait_pixel_skin_rule_catches_when_model_reports_natural(
+    skills, tmp_path, fake_provider
+):
+    # 模型报告 natural 时，像素检测兜底判发白 → 重大问题（确定性，不依赖模型感知）
+    import base64
+    import io
+
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.new("RGB", (400, 400), (230, 228, 224)).save(buf, format="JPEG")  # 青白/灰白皮肤
+    pale_image = base64.b64encode(buf.getvalue()).decode()
+    fake_provider.script("precheck", PRECHECK_PORTRAIT).script("review", REVIEW_CLEAN)
+    resp = await run(skills, tmp_path, fake_provider, ReviewRequest(image_base64=pale_image))
+    assert resp.route == "portrait"
+    assert PIXEL_SKIN_MAJOR_MESSAGE in resp.review.major_issues
+
+
+async def test_portrait_pixel_skin_rule_skips_warm_skin(
+    skills, tmp_path, fake_provider
+):
+    # 暖调肤色（高饱和）→ 像素检测不触发
+    import base64
+    import io
+
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.new("RGB", (400, 400), (205, 155, 115)).save(buf, format="JPEG")
+    warm_image = base64.b64encode(buf.getvalue()).decode()
+    fake_provider.script("precheck", PRECHECK_PORTRAIT).script("review", REVIEW_CLEAN)
+    resp = await run(skills, tmp_path, fake_provider, ReviewRequest(image_base64=warm_image))
+    assert resp.route == "portrait"
+    assert resp.review.major_issues == []
 
 
 def make_result(**kw) -> BranchReviewResult:

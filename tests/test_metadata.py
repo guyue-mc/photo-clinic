@@ -11,9 +11,33 @@ from PIL import Image
 from photo_clinic.metadata import (
     ImageTooLargeError,
     InvalidImageError,
+    DecodedImage,
     decode_image,
+    detect_pale_skin,
     inspect_metadata,
 )
+
+
+def _decoded_from_rgb(width: int, height: int, color: tuple[int, int, int]) -> DecodedImage:
+    buf = io.BytesIO()
+    Image.new("RGB", (width, height), color).save(buf, format="JPEG")
+    return DecodedImage(data=buf.getvalue(), media_type="image/jpeg", format="JPEG",
+                        width=width, height=height)
+
+
+def test_detect_pale_skin_flags_white_skin():
+    # 青白/灰白皮肤：低饱和高亮
+    assert detect_pale_skin(_decoded_from_rgb(400, 400, (230, 228, 224))) is True
+
+
+def test_detect_pale_skin_ok_for_warm_skin():
+    # 正常暖调肤色：高饱和，落在肤色区间
+    assert detect_pale_skin(_decoded_from_rgb(400, 400, (205, 155, 115))) is False
+
+
+def test_detect_pale_skin_ok_for_dark_background():
+    # 深色背景（无人脸信息）不应误判
+    assert detect_pale_skin(_decoded_from_rgb(400, 400, (30, 60, 90))) is False
 
 MAX = 10 * 1024 * 1024
 
