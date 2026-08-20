@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "photo-clinic"
-version = "0.1.2"
+version = "0.1.3"
 description = "摄影评审 Agent：AI 图判定 → 风景/人物分类 → 板块 rubric 评审（FastAPI + SKILL.md 驱动）"
 readme = "README.md"
 license = "MIT"
