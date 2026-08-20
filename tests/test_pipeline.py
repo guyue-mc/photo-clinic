@@ -326,6 +326,28 @@ def test_filter_focal_advice_with_known_focal_length():
     assert kept == ["可继续使用长焦压缩背景，突出主体"]
 
 
+def test_filter_focal_advice_drops_eyefocal_when_wide_used_well():
+    # 广角使用得当（评语确认无畸变/张力）时，剔除建议换人眼焦段的条目
+    from photo_clinic.schemas import DimensionScore, Improvement, StageAdvice
+
+    result = scored_result(
+        9.0,
+        DimensionScore(dimension="构图", score=3.0, comment="广角使用得当，人物居中无畸变，画面富有张力"),
+        DimensionScore(dimension="光线", score=4.0, comment="x"),
+        DimensionScore(dimension="后期", score=2.0, comment="x"),
+    )
+    result.improvements = StageAdvice(
+        pre_shooting=[
+            Improvement(aspect="焦段", suggestion="建议使用人眼焦段（约50mm）拍摄，减少边缘变形"),
+            Improvement(aspect="站位", suggestion="让人物更居中"),
+        ],
+        post_processing=[],
+    )
+    updated = _filter_focal_advice(result)
+    kept = [i.suggestion for i in updated.improvements.pre_shooting]
+    assert kept == ["让人物更居中"]
+
+
 def test_strip_texture_major_keeps_unrelated_issues():
     result = make_result(major_issues=["曝光硬伤：窗外大面积过曝死白"])
     assert _strip_texture_major(result) is result
@@ -539,7 +561,7 @@ async def test_suspect_ai_warns_above_threshold(skills, jpeg_image, tmp_path, fa
     resp = await run(skills, tmp_path, fake_provider, ReviewRequest(image_base64=jpeg_image))
     assert resp.route == "landscape"
     assert resp.ai_suspicion is not None
-    assert "疑似 AI 生成" in resp.ai_suspicion.warning
+    assert "疑似AI率" in resp.ai_suspicion.warning
     system = fake_provider.calls[1]["system"]
     assert "landscape-review" in system
     # 不再追加 AI rubric / 提示词要求：疑似路径也严格按本板块契约输出
@@ -548,8 +570,8 @@ async def test_suspect_ai_warns_above_threshold(skills, jpeg_image, tmp_path, fa
 
 
 async def test_uncertain_below_threshold_no_warning(skills, jpeg_image, tmp_path, fake_provider):
-    # 置信度 <50% 的 uncertain 不提示疑似 AI（视为普通照片）
-    low = {**PRECHECK_UNCERTAIN_LANDSCAPE, "ai_confidence": 40}
+    # 疑似AI率 <38% 的 uncertain 不提示疑似 AI（视为普通照片）
+    low = {**PRECHECK_UNCERTAIN_LANDSCAPE, "ai_confidence": 30}
     fake_provider.script("precheck", low).script("review", REVIEW)
     resp = await run(skills, tmp_path, fake_provider, ReviewRequest(image_base64=jpeg_image))
     assert resp.route == "landscape"

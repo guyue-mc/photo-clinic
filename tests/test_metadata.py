@@ -26,8 +26,22 @@ def _decoded_from_rgb(width: int, height: int, color: tuple[int, int, int]) -> D
 
 
 def test_detect_pale_skin_flags_white_skin():
-    # 青白/灰白皮肤：低饱和高亮
+    # 青白/灰白皮肤：低饱和高亮，皮肤占比极低
     assert detect_pale_skin(_decoded_from_rgb(400, 400, (230, 228, 224))) is True
+
+
+def test_detect_pale_skin_not_flagged_for_white_clothes_with_normal_skin():
+    # 白衣服/白背景 + 正常肤色（皮肤占比高）→ 不误判（8/12.jpg 场景）
+    buf = io.BytesIO()
+    img = Image.new("RGB", (400, 400), (245, 245, 245))  # 白底
+    for x in range(120, 280):
+        for y in range(120, 280):
+            img.putpixel((x, y), (205, 155, 115))  # 中央正常肤色块
+    img.save(buf, format="JPEG")
+    assert detect_pale_skin(
+        DecodedImage(data=buf.getvalue(), media_type="image/jpeg", format="JPEG",
+                     width=400, height=400)
+    ) is False
 
 
 def test_detect_pale_skin_ok_for_warm_skin():

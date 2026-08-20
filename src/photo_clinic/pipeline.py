@@ -17,11 +17,13 @@ from photo_clinic.prompts import (
     PRECHECK_USER_TEXT,
     REVIEW_RECHECK_USER_TEXT,
     REVIEW_USER_TEXT,
+    SUSPECT_PROMPT_USER_TEXT,
     build_precheck_system,
     build_recheck_review_system,
     build_recheck_system,
     build_reclassify_system,
     build_review_system,
+    build_suspect_prompt_system,
 )
 from photo_clinic.providers.base import Provider
 from photo_clinic.registry import ROUTE_TO_SKILL
@@ -32,6 +34,7 @@ from photo_clinic.schemas import (
     BranchReviewResult,
     DimensionScore,
     PrecheckResult,
+    PromptSuggestion,
     ReviewRequest,
     ReviewResponse,
     SubjectClassification,
@@ -161,10 +164,22 @@ async def run_review(
     )
     _add_usage(usage, tokens)
     ai_suspicion = None
-    # 仅置信度 ≥50% 才提示"疑似 AI"（低于此值视为普通照片，不出疑似点评）
+    # 疑似AI率 ≥50% 才提示"疑似 AI"（低于此值视为普通照片，不出疑似点评）；
+    # 疑似时额外生成提示词改进建议（若确认为 AI 图可参考）
     if pre.is_ai == "uncertain" and pre.ai_confidence >= 50.0:
+        suggestion, in_t, out_t = await llm.structured_call(
+            system=build_suspect_prompt_system(skills),
+            image=image,
+            user_text=SUSPECT_PROMPT_USER_TEXT,
+            schema=PromptSuggestion,
+            max_tokens=1024,
+            step="suspect_prompt",
+            model=model,
+        )
+        _add_usage(usage, (in_t, out_t))
         ai_suspicion = AiSuspicion(
-            warning=f"疑似 AI 生成（置信度 {pre.ai_confidence:.0f}%）：{ai_reason}"
+            warning=f"疑似AI率 {pre.ai_confidence:.0f}%：{ai_reason}",
+            prompt_suggestion=suggestion.text,
         )
     return ReviewResponse(
         route=pre.category,  # 此处 category 已排除 other，必为 landscape/portrait
@@ -340,12 +355,19 @@ def _filter_focal_advice(
 
     实际焦距（EXIF）已知时：建议断言与实际焦距相反的焦段 → 剔除（如长焦图建议广角）。
     焦距未知时：剔除自相矛盾的建议（「有压缩感却建议广角」等内部矛盾）。
+    广角使用得当（评语确认无畸变/有张力）时：剔除建议换人眼焦段（50/85mm）的条目。
     """
     if focal_mm is not None:
         is_wide = focal_mm <= 35
         is_tele = focal_mm > 70
     else:
         is_wide = is_tele = None
+
+    comment_text = "".join(d.comment for d in result.dimensions)
+    wide_used_well = "广角" in comment_text and any(
+        marker in comment_text
+        for marker in ("得当", "合理", "正确", "无畸变", "未畸变", "张力", "使用好")
+    )
 
     def _bad(item) -> bool:
         suggestion = item.suggestion
@@ -359,6 +381,8 @@ def _filter_focal_advice(
                 return True
             if is_tele is None and any(p in suggestion for p in _FOCAL_PERSPECTIVE):
                 return True
+        if wide_used_well and any(w in suggestion for w in ("人眼焦段", "50mm", "85mm")):
+            return True
         return False
 
     changed = False

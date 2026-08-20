@@ -14,6 +14,22 @@ PRECHECK_USER_TEXT = "对这张图片执行预检：判定是否 AI 生成，并
 PRECHECK_RECHECK_USER_TEXT = "对这张图片重新执行预检复核（重点：区分 AI 生成与重度后期）。"
 PRECHECK_RECLASSIFY_USER_TEXT = "对这张图片重新执行题材分类。"
 REVIEW_USER_TEXT = "对这张图片执行板块评审。"
+SUSPECT_PROMPT_USER_TEXT = "该图片疑似 AI 生成。若确认为 AI 图，给出可参考的提示词改进建议。"
+
+
+def build_suspect_prompt_system(registry: SkillRegistry) -> str:
+    """疑似 AI 图：只生成提示词改进建议。
+
+    不注入 ai-image-review 完整 rubric（其 JSON 契约会与单文本输出冲突）。
+    """
+    parts = [
+        BASE_PREAMBLE,
+        "对疑似 AI 生成的图片给出提示词改进建议。只输出一段纯文本：以「如果是AI生图」开头，"
+        "包含可直接使用的正向提示词与负面提示词（可粘贴给 AI 生图工具），"
+        "针对画面存在的问题（如过曝、发灰、光照平淡、细节不足）优化。"
+        "不要输出 JSON、不要输出评分或点评。",
+    ]
+    return "\n\n".join(parts)
 REVIEW_RECHECK_USER_TEXT = "对这张图片重新执行板块评审复核。"
 
 

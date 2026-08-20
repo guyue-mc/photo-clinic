@@ -96,9 +96,11 @@ _SKIN_VAL_MIN = 102  # V > 0.4
 # 发白像素：低饱和 + 高亮（白到不真实）
 _WHITE_SAT_MAX = 77  # S < 0.3
 _WHITE_VAL_MIN = 191  # V > 0.75
-# 判定阈值：发白像素占比高 且 正常肤色占比低 → 皮肤发白
+# 判定阈值：发白像素占比高 且 正常肤色占比极低 → 皮肤发白
+# 皮肤占比 <5%：真发白的脸几乎落不进正常肤色色域（1.jpg=1%）；
+# 正常脸+白衣服/天空场景皮肤占比仍高（8/11/12.jpg=9-57%），不会被误判
 PALE_SKIN_WHITE_RATIO = 0.15
-PALE_SKIN_MAX_SKIN_RATIO = 0.30
+PALE_SKIN_MAX_SKIN_RATIO = 0.05
 
 
 _BLUE_HUE_LO, _BLUE_HUE_HI = 90, 160  # 蓝色调色相区间（HSV 0-255 刻度）

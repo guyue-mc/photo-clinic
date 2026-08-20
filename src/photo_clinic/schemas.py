@@ -52,6 +52,7 @@ class AiSuspicion(BaseModel):
     """预检结果为 uncertain（疑似 AI）但进入风景/人物评审时的提醒。"""
 
     warning: str
+    prompt_suggestion: str | None = None  # 疑似 AI 时的提示词改进建议（若确认为 AI 图可参考；以「如果是AI生图」开头）
 
 
 class SubjectClassification(BaseModel):
@@ -98,6 +99,12 @@ class DimensionScore(BaseModel):
 class Usage(BaseModel):
     input_tokens: int = 0
     output_tokens: int = 0
+
+
+class PromptSuggestion(BaseModel):
+    """疑似 AI 图的提示词改进建议（单段文本）。"""
+
+    text: str
 
 
 class PrecheckResult(BaseModel):
